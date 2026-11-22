@@ -1,0 +1,6 @@
+node_modules/
+companion-settings.json
+proactive-state.json
+*.bak
+*.log
+.DS_Store

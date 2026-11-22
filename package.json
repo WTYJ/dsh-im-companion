@@ -1,0 +1,65 @@
+{
+  "name": "dsh-im-companion",
+  "version": "0.2.0",
+  "description": "DSH (@xmanrui/dsh-im) 独立伴生增强插件，提供分气泡连发、拟人打字延迟、主动消息熔断与睡眠免打扰顺延、核心文件只读锁及独立可视化开关。",
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "dsh-im",
+    "qq",
+    "wechat",
+    "feishu",
+    "telegram",
+    "chatbot",
+    "roleplay",
+    "companion"
+  ],
+  "author": "WTYJ (https://github.com/WTYJ)",
+  "license": "MIT",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/WTYJ/dsh-im-companion.git"
+  },
+  "homepage": "https://github.com/WTYJ/dsh-im-companion#readme",
+  "bugs": {
+    "url": "https://github.com/WTYJ/dsh-im-companion/issues"
+  },
+  "main": "./index.mjs",
+  "exports": {
+    ".": "./index.mjs",
+    "./client": "./lib/client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.mjs",
+    "config.mjs",
+    "route.mjs",
+    "lib/client.js",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-settings",
+        "@deepseek-ai/dsh-client-ui-slots",
+        "@deepseek-ai/dsh-client-locale"
+      ]
+    }
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  }
+}

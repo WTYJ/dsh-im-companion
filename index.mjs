@@ -1,0 +1,812 @@
+import { chmodSync, existsSync, readdirSync, readFileSync, statSync, writeFileSync, mkdirSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { dirname, extname, join } from 'node:path';
+import {
+  beijingDateParts,
+  computeNextProactiveTimestamp,
+  computeTypingDelayMs,
+  isInQuietHours,
+  normalizeConfig,
+  resolveLiveConfig,
+} from './config.mjs';
+import { draftTargetFromConversation } from './route.mjs';
+
+export const name = 'dsh-im-companion';
+export const inject = ['webServer'];
+export const SETTINGS_ROUTE = '/dsh-im-companion/settings';
+
+const STICKER_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp']);
+
+function sessionIdOf(session) {
+  const id = session?.id ?? session?.sessionId ?? session?.header?.id;
+  return typeof id === 'string' && id ? id : null;
+}
+
+function workspaceOf(agent) {
+  const candidates = [
+    agent?.workspace,
+    agent?.cwd,
+    agent?.session?.workspace,
+    agent?.session?.cwd,
+    agent?.session?.header?.cwd,
+  ];
+  for (const item of candidates) {
+    if (typeof item === 'string' && item.trim()) return item.trim();
+  }
+  return null;
+}
+
+function snapshotEventsOf(agent) {
+  const events = typeof agent?.session?.snapshotEvents === 'function'
+    ? agent.session.snapshotEvents()
+    : agent?.session?.events;
+  return Array.isArray(events) ? events : [];
+}
+
+function currentTurnOf(agent) {
+  const events = snapshotEventsOf(agent);
+  let turn = 0;
+  for (const event of events) {
+    if (event?.type === 'turn/start' && Number.isInteger(event.data?.turn)) {
+      turn = event.data.turn;
+    }
+  }
+  return turn;
+}
+
+export function classifyCurrentTurn(agent) {
+  const events = snapshotEventsOf(agent);
+  if (events.length === 0) return 'user';
+  let lastTurnStartIdx = -1;
+  for (let i = events.length - 1; i >= 0; i -= 1) {
+    if (events[i]?.type === 'turn/start') {
+      lastTurnStartIdx = i;
+      break;
+    }
+  }
+  const slice = lastTurnStartIdx >= 0 ? events.slice(lastTurnStartIdx + 1) : events;
+  let sawScheduleOrNotice = false;
+  let sawRealUser = false;
+  for (const ev of slice) {
+    if (ev?.type !== 'user/message') continue;
+    const src = ev.data?.source;
+    if (src?.kind === 'schedule' || src?.form === 'notice') {
+      sawScheduleOrNotice = true;
+    } else if (src?.kind === 'user' || src === undefined) {
+      sawRealUser = true;
+    }
+  }
+  if (sawRealUser) return 'user';
+  if (sawScheduleOrNotice) return 'proactive';
+  return 'user';
+}
+
+function stateFilePathFrom(baseConfig) {
+  if (!baseConfig?.configFile) return null;
+  return join(dirname(baseConfig.configFile), 'proactive-state.json');
+}
+
+export function createProactiveStateTracker({ stateFile = null, nowFn = Date.now } = {}) {
+  let state = {
+    unrepliedCount: 0,
+    lastProactiveAt: null,
+    lastUserReplyAt: null,
+    lastCountedTurnKey: null,
+  };
+
+  if (stateFile) {
+    try {
+      const loaded = JSON.parse(readFileSync(stateFile, 'utf8'));
+      if (loaded && typeof loaded === 'object') {
+        state = {
+          unrepliedCount: Number.isInteger(loaded.unrepliedCount) && loaded.unrepliedCount >= 0 ? loaded.unrepliedCount : 0,
+          lastProactiveAt: Number.isFinite(loaded.lastProactiveAt) ? loaded.lastProactiveAt : null,
+          lastUserReplyAt: Number.isFinite(loaded.lastUserReplyAt) ? loaded.lastUserReplyAt : null,
+          lastCountedTurnKey: typeof loaded.lastCountedTurnKey === 'string' ? loaded.lastCountedTurnKey : null,
+        };
+      }
+    } catch {
+      // start fresh
+    }
+  }
+
+  const persist = () => {
+    if (!stateFile) return;
+    try {
+      mkdirSync(dirname(stateFile), { recursive: true });
+      writeFileSync(stateFile, `${JSON.stringify(state, null, 2)}\n`, 'utf8');
+    } catch {
+      // ignore write errors
+    }
+  };
+
+  return {
+    getState() {
+      return { ...state };
+    },
+    reset() {
+      state = {
+        unrepliedCount: 0,
+        lastProactiveAt: null,
+        lastUserReplyAt: nowFn(),
+        lastCountedTurnKey: null,
+      };
+      persist();
+      return { ...state };
+    },
+    onUserTurn() {
+      if (state.unrepliedCount !== 0) {
+        state.unrepliedCount = 0;
+        state.lastUserReplyAt = nowFn();
+        persist();
+      } else {
+        state.lastUserReplyAt = nowFn();
+      }
+    },
+    checkOrCommitProactive(turnKey, guardConfig, { commit = false } = {}) {
+      if (!guardConfig?.enabled) {
+        return { allowed: true, reason: null, state: { ...state } };
+      }
+      const now = nowFn();
+      const alreadyCountedThisTurn = turnKey && state.lastCountedTurnKey === turnKey;
+
+      if (!alreadyCountedThisTurn) {
+        if (isInQuietHours(now, guardConfig)) {
+          return {
+            allowed: false,
+            reason: `quiet hours active (${guardConfig.quietStart ?? '02:30'}~${guardConfig.quietEnd ?? '11:30'})`,
+            state: { ...state },
+          };
+        }
+        if (state.unrepliedCount >= guardConfig.maxUnreplied) {
+          return {
+            allowed: false,
+            reason: `unreplied limit reached (${state.unrepliedCount}/${guardConfig.maxUnreplied})`,
+            state: { ...state },
+          };
+        }
+        const cooldownMs = guardConfig.cooldownMinutes * 60_000;
+        if (state.lastProactiveAt !== null && now - state.lastProactiveAt < cooldownMs) {
+          const remainMin = Math.ceil((cooldownMs - (now - state.lastProactiveAt)) / 60_000);
+          return {
+            allowed: false,
+            reason: `proactive cooldown active (${remainMin} min remaining)`,
+            state: { ...state },
+          };
+        }
+        if (commit) {
+          state.unrepliedCount += 1;
+          state.lastProactiveAt = now;
+          state.lastCountedTurnKey = turnKey || null;
+          persist();
+        }
+      }
+      return { allowed: true, reason: null, state: { ...state } };
+    },
+  };
+}
+
+/**
+ * Apply or release OS-level read-only file protection on `AGENTS.md` and `关于他.md`.
+ */
+export function applyFileGuard(fileGuardConfig, extraWorkspaceDir = null) {
+  if (!fileGuardConfig) return { lockedCount: 0, unlockedCount: 0 };
+  const dirs = new Set([
+    ...(Array.isArray(fileGuardConfig.workspaceDirs) ? fileGuardConfig.workspaceDirs : []),
+    join(homedir(), '.dsh', 'im'),
+    ...(extraWorkspaceDir ? [extraWorkspaceDir] : []),
+  ]);
+  const files = Array.isArray(fileGuardConfig.protectedFiles)
+    ? fileGuardConfig.protectedFiles
+    : ['AGENTS.md', '关于他.md'];
+
+  const mode = fileGuardConfig.enabled ? 0o444 : 0o666;
+  let count = 0;
+  for (const dir of dirs) {
+    if (!dir) continue;
+    for (const fileName of files) {
+      if (!fileName) continue;
+      const targetPath = join(dir, fileName);
+      try {
+        if (existsSync(targetPath) && statSync(targetPath).isFile()) {
+          chmodSync(targetPath, mode);
+          count += 1;
+        }
+      } catch {
+        // ignore permission errors on non-owned paths
+      }
+    }
+  }
+  return fileGuardConfig.enabled
+    ? { lockedCount: count, unlockedCount: 0 }
+    : { lockedCount: 0, unlockedCount: count };
+}
+
+function sleep(ms, signal) {
+  if (!ms || ms <= 0) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(signal.reason ?? new DOMException('Aborted', 'AbortError'));
+      return;
+    }
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(signal.reason ?? new DOMException('Aborted', 'AbortError'));
+    };
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+export function scanStickers(workspaceDir, dirName = '表情') {
+  if (!workspaceDir) return [];
+  const dirPath = join(workspaceDir, dirName);
+  try {
+    if (!statSync(dirPath).isDirectory()) return [];
+    const entries = readdirSync(dirPath, { withFileTypes: true });
+    const items = [];
+    for (const entry of entries) {
+      if (!entry.isFile()) continue;
+      if (entry.name.startsWith('_')) continue;
+      const ext = extname(entry.name).toLowerCase();
+      if (!STICKER_EXTENSIONS.has(ext)) continue;
+      items.push({
+        name: entry.name.slice(0, -ext.length),
+        fileName: entry.name,
+        relativePath: `${dirName}/${entry.name}`,
+      });
+    }
+    return items.sort((a, b) => a.name.localeCompare(b.name, 'zh-CN'));
+  } catch {
+    return [];
+  }
+}
+
+function channelAllowed(channel, channels) {
+  if (!Array.isArray(channels) || channels.length === 0) return true;
+  return channels.includes(String(channel ?? '').toLowerCase());
+}
+
+export async function resolveDeliveryRoute(dshIm, sessionId, cfg) {
+  const described = sessionId ? await dshIm.describeConversation(sessionId) : null;
+  if (described?.botId) {
+    const draftTarget = draftTargetFromConversation(described);
+    if (draftTarget) {
+      return {
+        botId: described.botId,
+        channel: described.channel,
+        targetOrDraft: draftTarget,
+        usedFallback: false,
+      };
+    }
+  }
+
+  if (!cfg?.fallbackTarget?.enabled) return null;
+  if (typeof dshIm?.listBots !== 'function' || typeof dshIm?.listTargets !== 'function') return null;
+
+  try {
+    const botsPayload = await dshIm.listBots();
+    const bots = Array.isArray(botsPayload?.bots)
+      ? botsPayload.bots
+      : Array.isArray(botsPayload)
+        ? botsPayload
+        : [];
+    const prefChannel = cfg.fallbackTarget.preferredChannel || 'qq';
+    const prefTargetId = cfg.fallbackTarget.preferredTargetId || '';
+
+    const orderedBots = [...bots].sort((a, b) => {
+      const aMatch = a?.channel === prefChannel ? 0 : 1;
+      const bMatch = b?.channel === prefChannel ? 0 : 1;
+      return aMatch - bMatch;
+    });
+
+    for (const bot of orderedBots) {
+      const botId = bot?.botId ?? bot?.id;
+      if (!botId) continue;
+      const targets = await dshIm.listTargets(botId);
+      if (!Array.isArray(targets) || targets.length === 0) continue;
+      const chosen = prefTargetId
+        ? targets.find((t) => t?.targetId === prefTargetId) ?? targets[0]
+        : targets[0];
+      if (chosen?.targetId) {
+        return {
+          botId,
+          channel: bot?.channel ?? prefChannel,
+          targetOrDraft: chosen.targetId,
+          usedFallback: true,
+        };
+      }
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
+function sendJson(response, status, body) {
+  const payload = JSON.stringify(body);
+  response.statusCode = status;
+  response.setHeader('Content-Type', 'application/json; charset=utf-8');
+  response.setHeader('Cache-Control', 'no-store');
+  response.end(payload);
+}
+
+function readJsonBody(request) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let total = 0;
+    request.on('data', (chunk) => {
+      const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      total += buf.length;
+      if (total > 64 * 1024) {
+        reject(new Error('Payload too large'));
+        return;
+      }
+      chunks.push(buf);
+    });
+    request.on('end', () => {
+      try {
+        const text = Buffer.concat(chunks).toString('utf8');
+        resolve(text.trim() ? JSON.parse(text) : {});
+      } catch (err) {
+        reject(err);
+      }
+    });
+    request.on('error', reject);
+  });
+}
+
+export function saveLiveConfig(baseConfig, patch = {}) {
+  const current = resolveLiveConfig(baseConfig);
+  const next = normalizeConfig({
+    ...current,
+    ...patch,
+    multiBubble: { ...current.multiBubble, ...(patch?.multiBubble ?? {}) },
+    typingDelay: { ...current.typingDelay, ...(patch?.typingDelay ?? {}) },
+    sticker: { ...current.sticker, ...(patch?.sticker ?? {}) },
+    proactiveGuard: { ...current.proactiveGuard, ...(patch?.proactiveGuard ?? {}) },
+    fallbackTarget: { ...current.fallbackTarget, ...(patch?.fallbackTarget ?? {}) },
+    fileGuard: { ...current.fileGuard, ...(patch?.fileGuard ?? {}) },
+    configFile: baseConfig.configFile,
+  });
+  if (baseConfig.configFile) {
+    mkdirSync(dirname(baseConfig.configFile), { recursive: true });
+    const persisted = {
+      enabled: next.enabled,
+      multiBubble: next.multiBubble,
+      typingDelay: next.typingDelay,
+      sticker: next.sticker,
+      proactiveGuard: next.proactiveGuard,
+      fallbackTarget: next.fallbackTarget,
+      fileGuard: next.fileGuard,
+    };
+    writeFileSync(baseConfig.configFile, `${JSON.stringify(persisted, null, 2)}\n`, 'utf8');
+  }
+  applyFileGuard(next.fileGuard);
+  return next;
+}
+
+function mountSettingsHttp(webCtx, getBaseConfig, setRuntimeConfig, proactiveTracker, logger) {
+  if (typeof webCtx?.webServer?.register !== 'function') return;
+  const registerRoute = () => webCtx.webServer.register({
+    kind: 'exact',
+    path: SETTINGS_ROUTE,
+    handler: async (request, response) => {
+      try {
+        if (request.method === 'GET') {
+          const cfg = resolveLiveConfig(getBaseConfig());
+          sendJson(response, 200, {
+            ok: true,
+            settings: cfg,
+            proactiveState: proactiveTracker.getState(),
+          });
+          return;
+        }
+        if (request.method === 'POST') {
+          const body = await readJsonBody(request);
+          if (body?.action === 'resetProactiveState') {
+            const resetState = proactiveTracker.reset();
+            sendJson(response, 200, {
+              ok: true,
+              settings: resolveLiveConfig(getBaseConfig()),
+              proactiveState: resetState,
+            });
+            return;
+          }
+          const updated = saveLiveConfig(getBaseConfig(), body);
+          setRuntimeConfig(updated);
+          sendJson(response, 200, {
+            ok: true,
+            settings: updated,
+            proactiveState: proactiveTracker.getState(),
+          });
+          return;
+        }
+        sendJson(response, 405, { ok: false, error: 'method-not-allowed' });
+      } catch (err) {
+        logger?.warn?.(`[${name}] settings HTTP error:`, err);
+        sendJson(response, 400, { ok: false, error: String(err?.message ?? err) });
+      }
+    },
+  });
+  if (typeof webCtx.effect === 'function') {
+    webCtx.effect(registerRoute, `${name}: settings route`);
+  } else {
+    registerRoute();
+  }
+}
+
+/**
+ * Observe global `session/event` stream so single-bubble proactive turns
+ * (where `im_send_bubbles` was not called) and user replies are 100% tracked.
+ */
+export function installSessionEventObserver(eventCtx, proactiveTracker, getConfig) {
+  if (typeof eventCtx?.on !== 'function') return null;
+  const turnStates = new Map();
+
+  return eventCtx.on('session/event', (session, event) => {
+    const sessionId = sessionIdOf(session);
+    if (!sessionId || !event?.type) return;
+
+    if (event.type === 'turn/start') {
+      const turn = Number.isInteger(event.data?.turn) ? event.data.turn : 0;
+      turnStates.set(sessionId, {
+        turn,
+        turnKey: `${sessionId}\u0000${turn}`,
+        sawUser: false,
+        sawProactive: false,
+      });
+      return;
+    }
+
+    if (event.type === 'user/message') {
+      let st = turnStates.get(sessionId);
+      if (!st) {
+        st = { turn: 0, turnKey: `${sessionId}\u00000`, sawUser: false, sawProactive: false };
+        turnStates.set(sessionId, st);
+      }
+      const src = event.data?.source;
+      if (src?.kind === 'schedule' || src?.form === 'notice') {
+        st.sawProactive = true;
+      } else if (src?.kind === 'user' || src === undefined) {
+        st.sawUser = true;
+        proactiveTracker.onUserTurn();
+      }
+      return;
+    }
+
+    if (event.type === 'turn/end') {
+      const st = turnStates.get(sessionId);
+      if (st && st.sawProactive && !st.sawUser) {
+        const cfg = getConfig();
+        if (cfg.enabled && cfg.proactiveGuard?.enabled) {
+          proactiveTracker.checkOrCommitProactive(st.turnKey, cfg.proactiveGuard, { commit: true });
+        }
+      }
+      turnStates.delete(sessionId);
+    }
+  }, { global: true });
+}
+
+export function createCompanionPlugin({ sleepFn = sleep, random = Math.random, nowFn = Date.now } = {}) {
+  return Object.freeze({
+    name,
+    inject,
+    apply(ctx, rawConfig = {}) {
+      let baseConfig = normalizeConfig(rawConfig);
+      const logger = typeof ctx?.logger === 'function' ? ctx.logger(name) : (ctx?.logger ?? console);
+      const turnBubbleCounts = new Map();
+      const turnSentTexts = new Map();
+      const proactiveTracker = createProactiveStateTracker({
+        stateFile: stateFilePathFrom(baseConfig),
+        nowFn,
+      });
+
+      const getConfig = () => resolveLiveConfig(baseConfig);
+      const setRuntimeConfig = (updated) => { baseConfig = updated; };
+      const getTurnKey = (sessionId, agent) => `${sessionId}\u0000${currentTurnOf(agent)}`;
+
+      // Apply file guard at startup
+      applyFileGuard(getConfig().fileGuard);
+
+      // 1. Mount HTTP settings endpoint immediately on root `webServer`
+      mountSettingsHttp(ctx, () => baseConfig, setRuntimeConfig, proactiveTracker, logger);
+
+      // 2. Mount global `session/event` observer for 100% accurate proactive/user tracking
+      if (typeof ctx?.on === 'function') {
+        installSessionEventObserver(ctx, proactiveTracker, getConfig);
+      }
+
+      // 3. Mount Agent tools & systemPrompt when `dshIm`, `tools`, `systemPrompt` are ready
+      const installAgentCapabilities = (toolCtx) => {
+        const dshIm = toolCtx?.dshIm ?? ctx?.dshIm;
+        const tools = toolCtx?.tools ?? ctx?.tools;
+        const systemPrompt = toolCtx?.systemPrompt ?? ctx?.systemPrompt;
+        if (!dshIm || typeof tools?.register !== 'function' || typeof systemPrompt?.context !== 'function') {
+          return;
+        }
+
+        if (typeof toolCtx?.on === 'function' && typeof ctx?.on !== 'function') {
+          installSessionEventObserver(toolCtx, proactiveTracker, getConfig);
+        }
+
+        const sendBubblesTool = Object.freeze({
+          name: 'im_send_bubbles',
+          description:
+            'Send 1 to 3 leading short chat bubbles to the current IM conversation with optional humanized typing delay. '
+            + 'Use this only when a reply naturally splits into multiple short messages; always leave the final sentence for your normal assistant reply so nothing is duplicated.',
+          parameters: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              messages: {
+                type: 'array',
+                description: 'Ordered short text bubbles to send BEFORE your final reply.',
+                minItems: 1,
+                maxItems: 4,
+                items: {
+                  type: 'string',
+                  minLength: 1,
+                },
+              },
+            },
+            required: ['messages'],
+          },
+          output: {
+            schema: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                sentCount: { type: 'number' },
+                sentMessages: {
+                  type: 'array',
+                  items: { type: 'string' },
+                },
+                skipped: { type: 'boolean' },
+                reason: { type: 'string' },
+              },
+              required: ['sentCount', 'skipped'],
+            },
+            render: (_args, value) => [{
+              type: 'text',
+              text: value.skipped
+                ? `Skipped sending bubbles (${value.reason ?? 'disabled'}). Send your full reply normally.`
+                : `Already delivered ${value.sentCount} leading bubble(s) to IM: ${JSON.stringify(value.sentMessages ?? [])}. Now output ONLY your final remaining sentence—DO NOT repeat any of the delivered sentences above.`,
+            }],
+          },
+          async execute(args, exec) {
+            const cfg = getConfig();
+            if (!cfg.enabled || !cfg.multiBubble.enabled) {
+              return { sentCount: 0, sentMessages: [], skipped: true, reason: 'multiBubble switch is disabled' };
+            }
+
+            const sessionId = sessionIdOf(exec?.agent?.session);
+            const turnKind = classifyCurrentTurn(exec?.agent);
+            const turnKey = getTurnKey(sessionId ?? 'no-session', exec?.agent);
+
+            if (turnKind === 'user') {
+              proactiveTracker.onUserTurn();
+            } else {
+              const check = proactiveTracker.checkOrCommitProactive(turnKey, cfg.proactiveGuard, { commit: true });
+              if (!check.allowed) {
+                return { sentCount: 0, sentMessages: [], skipped: true, reason: check.reason };
+              }
+            }
+
+            const routeInfo = await resolveDeliveryRoute(dshIm, sessionId, cfg);
+            if (!routeInfo) {
+              return { sentCount: 0, sentMessages: [], skipped: true, reason: 'current session is not bound to an IM chat and no fallback target found' };
+            }
+
+            if (!channelAllowed(routeInfo.channel, cfg.multiBubble.channels)) {
+              return { sentCount: 0, sentMessages: [], skipped: true, reason: `channel ${routeInfo.channel} is not enabled` };
+            }
+
+            const alreadySent = turnBubbleCounts.get(turnKey) ?? 0;
+            const remaining = Math.max(0, cfg.multiBubble.maxBubblesPerTurn - alreadySent);
+            if (remaining <= 0) {
+              return { sentCount: 0, sentMessages: [], skipped: true, reason: 'per-turn bubble limit reached' };
+            }
+
+            let seenSet = turnSentTexts.get(turnKey);
+            if (!seenSet) {
+              seenSet = new Set();
+              turnSentTexts.set(turnKey, seenSet);
+            }
+
+            const rawList = Array.isArray(args?.messages) ? args.messages : [];
+            const deduped = [];
+            for (const item of rawList) {
+              const text = [...String(item ?? '').trim()].slice(0, cfg.multiBubble.maxTextLength).join('');
+              if (!text || seenSet.has(text)) continue;
+              seenSet.add(text);
+              deduped.push(text);
+              if (deduped.length >= remaining) break;
+            }
+
+            if (deduped.length === 0) {
+              return { sentCount: 0, sentMessages: [], skipped: true, reason: 'no non-duplicate messages to send' };
+            }
+
+            let sentCount = 0;
+            const sentMessages = [];
+            for (let i = 0; i < deduped.length; i += 1) {
+              const text = deduped[i];
+              const delayMs = i === 0
+                ? Math.round(computeTypingDelayMs(text, cfg.typingDelay, random) * 0.5)
+                : computeTypingDelayMs(text, cfg.typingDelay, random);
+              await sleepFn(delayMs, exec?.signal);
+              const result = await dshIm.send(routeInfo.botId, routeInfo.targetOrDraft, text, {
+                signal: exec?.signal,
+                format: 'plain',
+              });
+              if (result?.sent !== true) {
+                throw new Error(`dshIm.send did not confirm delivery for bubble #${i + 1}`);
+              }
+              sentCount += 1;
+              sentMessages.push(text);
+              turnBubbleCounts.set(turnKey, alreadySent + sentCount);
+            }
+
+            if (turnBubbleCounts.size > 200) {
+              const firstKey = turnBubbleCounts.keys().next().value;
+              if (firstKey !== undefined) {
+                turnBubbleCounts.delete(firstKey);
+                turnSentTexts.delete(firstKey);
+              }
+            }
+
+            return { sentCount, sentMessages, skipped: false };
+          },
+        });
+
+        const listStickersTool = Object.freeze({
+          name: 'im_list_stickers',
+          description: 'List available sticker/meme image files in the workspace sticker folder so you can pick one to send via dsh_im_return_file.',
+          parameters: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {},
+          },
+          output: {
+            schema: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                enabled: { type: 'boolean' },
+                dirName: { type: 'string' },
+                stickers: {
+                  type: 'array',
+                  items: {
+                    type: 'object',
+                    properties: {
+                      name: { type: 'string' },
+                      relativePath: { type: 'string' },
+                    },
+                    required: ['name', 'relativePath'],
+                  },
+                },
+              },
+              required: ['enabled', 'dirName', 'stickers'],
+            },
+            render: (_args, value) => [{
+              type: 'text',
+              text: !value.enabled
+                ? 'Sticker feature is currently disabled.'
+                : value.stickers.length === 0
+                  ? `No sticker images found in "${value.dirName}/". Do not mention stickers to the user.`
+                  : `Available stickers in "${value.dirName}/": ${value.stickers.map((s) => `${s.name} (${s.relativePath})`).join(', ')}. Send at most one via dsh_im_return_file.`,
+            }],
+          },
+          async execute(_args, exec) {
+            const cfg = getConfig();
+            if (!cfg.enabled || !cfg.sticker.enabled) {
+              return { enabled: false, dirName: cfg.sticker.dirName, stickers: [] };
+            }
+            const ws = workspaceOf(exec?.agent);
+            const stickers = scanStickers(ws, cfg.sticker.dirName).map(({ name: sName, relativePath }) => ({
+              name: sName,
+              relativePath,
+            }));
+            return { enabled: true, dirName: cfg.sticker.dirName, stickers };
+          },
+        });
+
+        tools.register(sendBubblesTool);
+        tools.register(listStickersTool);
+
+        systemPrompt.context({
+          name: 'dsh-im-companion:guidance',
+          order: 118,
+          text: (assembly) => {
+            const cfg = getConfig();
+            if (!cfg.enabled) return '';
+            const ws = workspaceOf(assembly?.agent);
+            applyFileGuard(cfg.fileGuard, ws);
+
+            const sessionId = sessionIdOf(assembly?.agent?.session);
+            const described = sessionId && typeof dshIm.describeConversationSync === 'function'
+              ? dshIm.describeConversationSync(sessionId)
+              : null;
+            if (!described?.botId && !cfg.fallbackTarget.enabled) return '';
+
+            const turnKind = classifyCurrentTurn(assembly?.agent);
+            const turnKey = getTurnKey(sessionId ?? 'no-session', assembly?.agent);
+
+            if (turnKind === 'user') {
+              proactiveTracker.onUserTurn();
+            }
+
+            const lines = [];
+
+            if (cfg.fileGuard.enabled) {
+              lines.push(
+                `核心文件只读锁已开启：${cfg.fileGuard.protectedFiles.join('、')} 已被系统锁定为只读，严禁修改，所有新记忆请写入 记忆.md 或 日记/。`,
+              );
+            }
+
+            if (cfg.proactiveGuard.enabled) {
+              if (turnKind === 'proactive') {
+                const check = proactiveTracker.checkOrCommitProactive(turnKey, cfg.proactiveGuard, { commit: true });
+                if (!check.allowed) {
+                  lines.push(
+                    `【主动消息熔断已触发（${check.reason}）】主人尚未回复、处于冷却期或正在睡眠免打扰时段，本轮请不要再定新的主动提醒。`,
+                  );
+                }
+              }
+              const st = proactiveTracker.getState();
+              const cooldownH = (cfg.proactiveGuard.cooldownMinutes / 60).toFixed(1).replace(/\.0$/, '');
+              const suggestedNextTs = computeNextProactiveTimestamp(nowFn(), cfg.proactiveGuard, random);
+              const suggestedTimeStr = beijingDateParts(suggestedNextTs).formatted;
+              if (st.unrepliedCount >= cfg.proactiveGuard.maxUnreplied) {
+                lines.push(
+                  `IM 主动消息管控：你已连续主动找主人 ${st.unrepliedCount}/${cfg.proactiveGuard.maxUnreplied} 次未获回复，请暂停定新的主动聊天提醒，等主人回复后再继续。`,
+                );
+              } else {
+                const quietNote = cfg.proactiveGuard.quietHoursEnabled
+                  ? `（已自动避开 ${cfg.proactiveGuard.quietStart}～${cfg.proactiveGuard.quietEnd} 睡眠免打扰时段）`
+                  : '';
+                lines.push(
+                  `IM 主动消息管控：当前未回复主动次数 ${st.unrepliedCount}/${cfg.proactiveGuard.maxUnreplied}（上限 ${cfg.proactiveGuard.maxUnreplied} 次，主人一回复即归零）；每隔约 ${cooldownH} 小时可主动找他一次，若要定下一次主动提醒，建议选在北京时间 ${suggestedTimeStr} 左右${quietNote}。`,
+                );
+              }
+            }
+
+            const activeChannel = described?.channel ?? cfg.fallbackTarget.preferredChannel;
+            if (cfg.multiBubble.enabled && channelAllowed(activeChannel, cfg.multiBubble.channels)) {
+              lines.push(
+                `IM 分气泡发送已开启：如果日常闲聊自然适合分成 2～${cfg.multiBubble.maxBubblesPerTurn + 1} 条短气泡连发，可以先调用 im_send_bubbles 发送前面 1～${cfg.multiBubble.maxBubblesPerTurn} 句，再把最后一句作为本次正常回复输出（严禁重复 im_send_bubbles 已经发过的句子）。一句话就能说完、或回复长篇正事/代码时直接正常回复即可，不用强行拆条。`,
+              );
+            }
+
+            if (cfg.sticker.enabled) {
+              const stickers = scanStickers(ws, cfg.sticker.dirName);
+              if (stickers.length > 0) {
+                lines.push(
+                  `IM 表情包已开启：情绪到位时偶尔可调用 im_list_stickers 查看「${cfg.sticker.dirName}/」里的图，选一张最贴合语境的通过 dsh_im_return_file 发送；每次最多发一张，发完照常说话，不要连着甩图。`,
+                );
+              }
+            }
+
+            return lines.join('\n');
+          },
+        });
+      };
+
+      if (typeof ctx?.inject === 'function') {
+        ctx.inject(['dshIm', 'tools', 'systemPrompt'], installAgentCapabilities);
+      } else {
+        installAgentCapabilities(ctx);
+      }
+
+      logger?.info?.(`[${name}] host ready: ${SETTINGS_ROUTE}`);
+    },
+  });
+}
+
+const defaultPlugin = createCompanionPlugin();
+export const apply = defaultPlugin.apply;
+export default defaultPlugin;

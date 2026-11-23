@@ -2,6 +2,7 @@ node_modules/
 AGENTS.md
 companion-settings.json
 proactive-state.json
+superseded-sessions.json
 *.bak
 *.log
 .DS_Store

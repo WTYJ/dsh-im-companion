@@ -1,6 +1,6 @@
 {
   "name": "dsh-im-companion",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "DSH (@xmanrui/dsh-im) 独立伴生增强插件，提供分气泡连发、拟人打字延迟、主动消息熔断与睡眠免打扰顺延、核心文件只读锁、防休眠保活、农历重要日子提醒及独立可视化开关。",
   "keywords": [
     "deepseek-harness",

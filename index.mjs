@@ -293,7 +293,7 @@ function channelAllowed(channel, channels) {
   return channels.includes(String(channel ?? '').toLowerCase());
 }
 
-export async function resolveDeliveryRoute(dshIm, sessionId, cfg) {
+export async function resolveDeliveryRoute(dshIm, sessionId, cfg, { isSuperseded = false } = {}) {
   const described = sessionId ? await dshIm.describeConversation(sessionId) : null;
   if (described?.botId) {
     const draftTarget = draftTargetFromConversation(described);
@@ -305,6 +305,10 @@ export async function resolveDeliveryRoute(dshIm, sessionId, cfg) {
         usedFallback: false,
       };
     }
+  }
+
+  if (isSuperseded && cfg?.sessionSwitchGuard?.enabled && cfg?.sessionSwitchGuard?.blockFallbackDelivery) {
+    return null;
   }
 
   if (!cfg?.fallbackTarget?.enabled) return null;
@@ -395,6 +399,7 @@ export function saveLiveConfig(baseConfig, patch = {}) {
     fileGuard: { ...current.fileGuard, ...(patch?.fileGuard ?? {}) },
     keepAwake: { ...current.keepAwake, ...(patch?.keepAwake ?? {}) },
     importantDates: { ...current.importantDates, ...(patch?.importantDates ?? {}) },
+    sessionSwitchGuard: { ...current.sessionSwitchGuard, ...(patch?.sessionSwitchGuard ?? {}) },
     configFile: baseConfig.configFile,
   });
   if (baseConfig.configFile) {
@@ -409,6 +414,7 @@ export function saveLiveConfig(baseConfig, patch = {}) {
       fileGuard: next.fileGuard,
       keepAwake: next.keepAwake,
       importantDates: next.importantDates,
+      sessionSwitchGuard: next.sessionSwitchGuard,
     };
     writeFileSync(baseConfig.configFile, `${JSON.stringify(persisted, null, 2)}\n`, 'utf8');
   }
@@ -416,7 +422,7 @@ export function saveLiveConfig(baseConfig, patch = {}) {
   return next;
 }
 
-function mountSettingsHttp(webCtx, getBaseConfig, setRuntimeConfig, proactiveTracker, keepAwakeManager, logger) {
+function mountSettingsHttp(webCtx, getBaseConfig, setRuntimeConfig, proactiveTracker, keepAwakeManager, supersededTracker, logger) {
   if (typeof webCtx?.webServer?.register !== 'function') return;
   const registerRoute = () => webCtx.webServer.register({
     kind: 'exact',
@@ -431,6 +437,7 @@ function mountSettingsHttp(webCtx, getBaseConfig, setRuntimeConfig, proactiveTra
             settings: cfg,
             proactiveState: proactiveTracker.getState(),
             keepAwakeStatus: keepAwakeManager.getStatus(),
+            sessionSwitchState: supersededTracker.getState(),
           });
           return;
         }
@@ -443,6 +450,7 @@ function mountSettingsHttp(webCtx, getBaseConfig, setRuntimeConfig, proactiveTra
               settings: resolveLiveConfig(getBaseConfig()),
               proactiveState: resetState,
               keepAwakeStatus: keepAwakeManager.getStatus(),
+              sessionSwitchState: supersededTracker.getState(),
             });
             return;
           }
@@ -454,6 +462,7 @@ function mountSettingsHttp(webCtx, getBaseConfig, setRuntimeConfig, proactiveTra
             settings: updated,
             proactiveState: proactiveTracker.getState(),
             keepAwakeStatus: kaStatus,
+            sessionSwitchState: supersededTracker.getState(),
           });
           return;
         }
@@ -580,7 +589,165 @@ export function installPreReplyPauseMiddleware(eventCtx, dshIm, getConfig, { sle
   }, { global: true });
 }
 
-export function createCompanionPlugin({ sleepFn = sleep, random = Math.random, nowFn = Date.now, keepAwakeFactory = createKeepAwakeManager } = {}) {
+function supersededStateFilePathFrom(baseConfig) {
+  if (!baseConfig?.configFile) return null;
+  return join(dirname(baseConfig.configFile), 'superseded-sessions.json');
+}
+
+function defaultScheduleStoragePath() {
+  const dshHome = process.env.DSH_HOME?.trim() ? process.env.DSH_HOME.trim() : join(homedir(), '.dsh');
+  return join(dshHome, 'storages', 'schedule.json');
+}
+
+export function readActiveSchedulesForSession(sessionId, scheduleFilePath = defaultScheduleStoragePath()) {
+  if (!sessionId || !scheduleFilePath || !existsSync(scheduleFilePath)) return [];
+  try {
+    const raw = JSON.parse(readFileSync(scheduleFilePath, 'utf8'));
+    const tasks = raw?.tables?.tasks;
+    if (!tasks || typeof tasks !== 'object') return [];
+    const results = [];
+    for (const entry of Object.values(tasks)) {
+      if (entry?.status !== 'active') continue;
+      if (entry?.target?.sessionId !== sessionId) continue;
+      results.push({
+        id: entry?.record?.id ?? '',
+        title: String(entry?.record?.title ?? '').trim() || '未命名提醒',
+        scheduledAt: entry?.record?.scheduledAt ?? null,
+      });
+    }
+    return results;
+  } catch {
+    return [];
+  }
+}
+
+export function createSupersededSessionTracker({
+  stateFile = null,
+  scheduleFilePath = defaultScheduleStoragePath(),
+  nowFn = Date.now,
+} = {}) {
+  let state = {
+    superseded: {},
+    pendingHandoff: {},
+  };
+
+  if (stateFile) {
+    try {
+      const loaded = JSON.parse(readFileSync(stateFile, 'utf8'));
+      if (loaded && typeof loaded === 'object') {
+        state = {
+          superseded: loaded.superseded && typeof loaded.superseded === 'object' ? { ...loaded.superseded } : {},
+          pendingHandoff: loaded.pendingHandoff && typeof loaded.pendingHandoff === 'object' ? { ...loaded.pendingHandoff } : {},
+        };
+      }
+    } catch {
+      // start fresh
+    }
+  }
+
+  const persist = () => {
+    if (!stateFile) return;
+    try {
+      mkdirSync(dirname(stateFile), { recursive: true });
+      writeFileSync(stateFile, `${JSON.stringify(state, null, 2)}\n`, 'utf8');
+    } catch {
+      // ignore write errors
+    }
+  };
+
+  const chatKeyOf = (payload) => {
+    const botId = String(payload?.botId ?? '').trim();
+    const conv = String(payload?.conversationKey ?? '').trim();
+    return botId && conv ? `${botId}\u0000${conv}` : null;
+  };
+
+  return {
+    getState() {
+      return {
+        supersededCount: Object.keys(state.superseded).length,
+      };
+    },
+    isSuperseded(sessionId) {
+      return Boolean(sessionId && Object.prototype.hasOwnProperty.call(state.superseded, sessionId));
+    },
+    markUnbound(payload) {
+      const sid = String(payload?.sessionId ?? '').trim();
+      if (!sid) return;
+      state.superseded[sid] = {
+        unboundAt: nowFn(),
+        channel: payload?.channel ?? null,
+        botId: payload?.botId ?? null,
+        conversationKey: payload?.conversationKey ?? null,
+      };
+      // Bound map size to 200 most recent unbound sessions
+      const keys = Object.keys(state.superseded);
+      if (keys.length > 200) {
+        const sorted = keys.sort((a, b) => (state.superseded[a]?.unboundAt ?? 0) - (state.superseded[b]?.unboundAt ?? 0));
+        for (const k of sorted.slice(0, keys.length - 200)) {
+          delete state.superseded[k];
+        }
+      }
+      const cKey = chatKeyOf(payload);
+      if (cKey) {
+        const pending = readActiveSchedulesForSession(sid, scheduleFilePath);
+        if (pending.length > 0) {
+          state.pendingHandoff[cKey] = {
+            fromSessionId: sid,
+            recordedAt: nowFn(),
+            tasks: pending.slice(0, 10),
+          };
+        }
+      }
+      persist();
+    },
+    markBound(payload) {
+      const sid = String(payload?.sessionId ?? '').trim();
+      if (!sid) return;
+      if (Object.prototype.hasOwnProperty.call(state.superseded, sid)) {
+        delete state.superseded[sid];
+        persist();
+      }
+    },
+    consumeHandoffNotices(botId, conversationKey) {
+      const cKey = botId && conversationKey ? `${botId}\u0000${conversationKey}` : null;
+      if (!cKey || !state.pendingHandoff[cKey]) return [];
+      const entry = state.pendingHandoff[cKey];
+      delete state.pendingHandoff[cKey];
+      persist();
+      return Array.isArray(entry?.tasks) ? entry.tasks : [];
+    },
+  };
+}
+
+export function installSessionBindingGuard(eventCtx, supersededTracker, getConfig, logger) {
+  if (typeof eventCtx?.on !== 'function') return null;
+
+  const offUnbind = eventCtx.on('dsh-im/session-unbind', (payload) => {
+    const cfg = getConfig();
+    if (!cfg?.enabled || !cfg?.sessionSwitchGuard?.enabled) return;
+    supersededTracker.markUnbound(payload);
+    logger?.info?.(`[${name}] marked unbound session as superseded: ${payload?.sessionId ?? 'unknown'}`);
+  }, { global: true });
+
+  const offBind = eventCtx.on('dsh-im/session-pre-bind', (payload) => {
+    const cfg = getConfig();
+    if (!cfg?.enabled || !cfg?.sessionSwitchGuard?.enabled) return;
+    supersededTracker.markBound(payload);
+  }, { global: true });
+
+  return () => {
+    offUnbind?.();
+    offBind?.();
+  };
+}
+
+export function createCompanionPlugin({
+  sleepFn = sleep,
+  random = Math.random,
+  nowFn = Date.now,
+  keepAwakeFactory = createKeepAwakeManager,
+  scheduleFilePath = defaultScheduleStoragePath(),
+} = {}) {
   return Object.freeze({
     name,
     inject,
@@ -591,6 +758,11 @@ export function createCompanionPlugin({ sleepFn = sleep, random = Math.random, n
       const turnSentTexts = new Map();
       const proactiveTracker = createProactiveStateTracker({
         stateFile: stateFilePathFrom(baseConfig),
+        nowFn,
+      });
+      const supersededTracker = createSupersededSessionTracker({
+        stateFile: supersededStateFilePathFrom(baseConfig),
+        scheduleFilePath,
         nowFn,
       });
       const keepAwakeManager = keepAwakeFactory({ logger });
@@ -609,11 +781,15 @@ export function createCompanionPlugin({ sleepFn = sleep, random = Math.random, n
       }
 
       // 1. Mount HTTP settings endpoint immediately on root `webServer`
-      mountSettingsHttp(ctx, () => baseConfig, setRuntimeConfig, proactiveTracker, keepAwakeManager, logger);
+      mountSettingsHttp(ctx, () => baseConfig, setRuntimeConfig, proactiveTracker, keepAwakeManager, supersededTracker, logger);
 
-      // 2. Mount global `session/event` observer for 100% accurate proactive/user tracking
+      // 2. Mount global `session/event` & `dsh-im/session-unbind` observers
       if (typeof ctx?.on === 'function') {
         installSessionEventObserver(ctx, proactiveTracker, getConfig);
+        const disposeBindingGuard = installSessionBindingGuard(ctx, supersededTracker, getConfig, logger);
+        if (disposeBindingGuard && typeof ctx?.effect === 'function') {
+          ctx.effect(() => disposeBindingGuard, `${name}: session binding guard`);
+        }
       }
 
       // 3. Mount Agent tools & systemPrompt when `dshIm`, `tools`, `systemPrompt` are ready
@@ -680,6 +856,11 @@ export function createCompanionPlugin({ sleepFn = sleep, random = Math.random, n
             }
 
             const sessionId = sessionIdOf(exec?.agent?.session);
+            const isSuperseded = supersededTracker.isSuperseded(sessionId);
+            if (isSuperseded && cfg.sessionSwitchGuard?.enabled && cfg.sessionSwitchGuard?.blockFallbackDelivery) {
+              return { sentCount: 0, sentMessages: [], skipped: true, reason: 'session superseded by a newer IM session' };
+            }
+
             const turnKind = classifyCurrentTurn(exec?.agent);
             const turnKey = getTurnKey(sessionId ?? 'no-session', exec?.agent);
 
@@ -692,7 +873,7 @@ export function createCompanionPlugin({ sleepFn = sleep, random = Math.random, n
               }
             }
 
-            const routeInfo = await resolveDeliveryRoute(dshIm, sessionId, cfg);
+            const routeInfo = await resolveDeliveryRoute(dshIm, sessionId, cfg, { isSuperseded });
             if (!routeInfo) {
               return { sentCount: 0, sentMessages: [], skipped: true, reason: 'current session is not bound to an IM chat and no fallback target found' };
             }
@@ -924,6 +1105,12 @@ export function createCompanionPlugin({ sleepFn = sleep, random = Math.random, n
             const described = sessionId && typeof dshIm.describeConversationSync === 'function'
               ? dshIm.describeConversationSync(sessionId)
               : null;
+
+            // If this session was superseded by /new or session switch, instruct it to stop and cancel its remaining schedules
+            if (!described?.botId && cfg.sessionSwitchGuard?.enabled && supersededTracker.isSuperseded(sessionId)) {
+              return '【旧会话已淘汰防分身】当前会话已被新的 IM 会话替代解绑。请勿再向 IM 发送消息，也不要再创建新的定时提醒；请立即使用定时任务管理工具取消本会话名下所有剩余待触发的定时任务。';
+            }
+
             if (!described?.botId && !cfg.fallbackTarget.enabled) return '';
 
             const turnKind = classifyCurrentTurn(assembly?.agent);
@@ -934,6 +1121,18 @@ export function createCompanionPlugin({ sleepFn = sleep, random = Math.random, n
             }
 
             const lines = [];
+
+            if (described?.botId && cfg.sessionSwitchGuard?.enabled && cfg.sessionSwitchGuard?.handoffPendingNotice) {
+              const handoffTasks = supersededTracker.consumeHandoffNotices(described.botId, described.conversationKey);
+              if (handoffTasks.length > 0) {
+                const descList = handoffTasks
+                  .map((t) => `「${t.title}」${t.scheduledAt ? `（${t.scheduledAt}）` : ''}`)
+                  .join('、');
+                lines.push(
+                  `【新会话提醒交接】刚才被切换掉的旧会话中曾有未触发的定时提醒：${descList}。如果其中有主人明确约定的重要事项提醒，可按需在本新会话重新定一下；普通闲聊主动提醒无需照搬。`,
+                );
+              }
+            }
 
             if (cfg.fileGuard.enabled) {
               lines.push(

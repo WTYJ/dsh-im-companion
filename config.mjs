@@ -68,6 +68,11 @@ export const DEFAULT_CONFIG = Object.freeze({
     fileName: '重要日子.md',
     windowDays: 30,
   }),
+  sessionSwitchGuard: Object.freeze({
+    enabled: true,
+    blockFallbackDelivery: true,
+    handoffPendingNotice: true,
+  }),
 });
 
 function isRecord(value) {
@@ -105,6 +110,7 @@ export function normalizeConfig(raw = {}) {
   const fg = mergeSection(DEFAULT_CONFIG.fileGuard, src.fileGuard);
   const ka = mergeSection(DEFAULT_CONFIG.keepAwake, src.keepAwake);
   const idates = mergeSection(DEFAULT_CONFIG.importantDates, src.importantDates);
+  const ssg = mergeSection(DEFAULT_CONFIG.sessionSwitchGuard, src.sessionSwitchGuard);
 
   const channels = Array.isArray(mb.channels)
     ? mb.channels.map((c) => String(c).trim().toLowerCase()).filter(Boolean)
@@ -186,6 +192,11 @@ export function normalizeConfig(raw = {}) {
         : DEFAULT_CONFIG.importantDates.fileName,
       windowDays: Math.floor(numOr(idates.windowDays, DEFAULT_CONFIG.importantDates.windowDays, { min: 1, max: 120 })),
     },
+    sessionSwitchGuard: {
+      enabled: boolOr(ssg.enabled, DEFAULT_CONFIG.sessionSwitchGuard.enabled),
+      blockFallbackDelivery: boolOr(ssg.blockFallbackDelivery, DEFAULT_CONFIG.sessionSwitchGuard.blockFallbackDelivery),
+      handoffPendingNotice: boolOr(ssg.handoffPendingNotice, DEFAULT_CONFIG.sessionSwitchGuard.handoffPendingNotice),
+    },
   };
 }
 
@@ -205,6 +216,7 @@ export function resolveLiveConfig(baseConfig) {
       fileGuard: mergeSection(baseConfig.fileGuard, raw.fileGuard),
       keepAwake: mergeSection(baseConfig.keepAwake, raw.keepAwake),
       importantDates: mergeSection(baseConfig.importantDates, raw.importantDates),
+      sessionSwitchGuard: mergeSection(baseConfig.sessionSwitchGuard, raw.sessionSwitchGuard),
       configFile: baseConfig.configFile,
     });
   } catch {

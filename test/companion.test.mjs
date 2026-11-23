@@ -541,3 +541,123 @@ test('tailPause and preReplyPause switches work and pre-step middleware only del
   );
   assert.deepEqual(sleeps, [1800]);
 });
+
+test('sessionSwitchGuard blocks superseded session fallback, instructs schedule cleanup, and hands off pending tasks', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-im-ssg-'));
+  try {
+    const schedPath = join(dir, 'schedule.json');
+    writeFileSync(
+      schedPath,
+      JSON.stringify({
+        tables: {
+          tasks: {
+            t1: {
+              status: 'active',
+              target: { kind: 'session', sessionId: 'old-sess' },
+              record: { id: 't1', title: '提醒做终末地日常', scheduledAt: '2026-11-24T07:30:00.000Z' },
+            },
+            t2: {
+              status: 'ended',
+              target: { kind: 'session', sessionId: 'old-sess' },
+              record: { id: 't2', title: '已结束任务', scheduledAt: '2026-11-23T07:30:00.000Z' },
+            },
+          },
+        },
+      }),
+      'utf8',
+    );
+
+    const listeners = new Map();
+    const tools = new Map();
+    const prompts = [];
+    const sent = [];
+    let activeSessionId = 'old-sess';
+
+    const ctx = {
+      on(eventName, fn) {
+        if (!listeners.has(eventName)) listeners.set(eventName, []);
+        listeners.get(eventName).push(fn);
+        return () => {};
+      },
+      dshIm: {
+        async describeConversation(sid) {
+          return sid === activeSessionId
+            ? { channel: 'qq', botId: 'bot1', conversationKey: 'c2c:U1' }
+            : null;
+        },
+        describeConversationSync(sid) {
+          return sid === activeSessionId
+            ? { channel: 'qq', botId: 'bot1', conversationKey: 'c2c:U1' }
+            : null;
+        },
+        async listBots() {
+          return [{ botId: 'bot1', channel: 'qq' }];
+        },
+        async listTargets() {
+          return [{ targetId: 'target_1' }];
+        },
+        async send(botId, target, text) {
+          sent.push({ botId, target, text });
+          return { sent: true };
+        },
+      },
+      tools: { register: (t) => tools.set(t.name, t) },
+      systemPrompt: { context: (c) => prompts.push(c) },
+    };
+
+    const plugin = createCompanionPlugin({
+      sleepFn: async () => {},
+      scheduleFilePath: schedPath,
+    });
+    plugin.apply(ctx, {
+      configFile: false,
+      keepAwake: { enabled: false },
+      fallbackTarget: { enabled: true },
+      sessionSwitchGuard: { enabled: true, blockFallbackDelivery: true, handoffPendingNotice: true },
+    });
+
+    // Simulate /new switching chat from old-sess to new-sess
+    activeSessionId = 'new-sess';
+    for (const fn of listeners.get('dsh-im/session-unbind') || []) {
+      fn({ channel: 'qq', botId: 'bot1', conversationKey: 'c2c:U1', sessionId: 'old-sess' });
+    }
+    for (const fn of listeners.get('dsh-im/session-pre-bind') || []) {
+      fn({ channel: 'qq', botId: 'bot1', conversationKey: 'c2c:U1', sessionId: 'new-sess' });
+    }
+
+    // 1. Old session trying to send bubbles is blocked (no fallback leak!)
+    const bubbleTool = tools.get('im_send_bubbles');
+    const oldRes = await bubbleTool.execute(
+      { messages: ['分身消息'] },
+      { agent: { session: { id: 'old-sess', events: [] } } },
+    );
+    assert.equal(oldRes.skipped, true);
+    assert.match(oldRes.reason, /superseded/);
+    assert.equal(sent.length, 0);
+
+    // 2. Old session receives explicit stop-and-cancel-schedules directive
+    const oldPrompt = prompts[0].text({ agent: { session: { id: 'old-sess', events: [] } } });
+    assert.match(oldPrompt, /旧会话已淘汰防分身/);
+    assert.match(oldPrompt, /取消本会话名下所有剩余待触发的定时任务/);
+
+    // 3. New session receives one-time handoff notice for active task t1 (not ended t2)
+    const newPrompt1 = prompts[0].text({ agent: { session: { id: 'new-sess', events: [] } } });
+    assert.match(newPrompt1, /新会话提醒交接/);
+    assert.match(newPrompt1, /提醒做终末地日常/);
+    assert.doesNotMatch(newPrompt1, /已结束任务/);
+
+    // 4. Subsequent turn on new session does not repeat the handoff notice
+    const newPrompt2 = prompts[0].text({ agent: { session: { id: 'new-sess', events: [] } } });
+    assert.doesNotMatch(newPrompt2, /新会话提醒交接/);
+
+    // 5. Switching back to old-sess clears superseded mark
+    activeSessionId = 'old-sess';
+    for (const fn of listeners.get('dsh-im/session-pre-bind') || []) {
+      fn({ channel: 'qq', botId: 'bot1', conversationKey: 'c2c:U1', sessionId: 'old-sess' });
+    }
+    const backPrompt = prompts[0].text({ agent: { session: { id: 'old-sess', events: [] } } });
+    assert.doesNotMatch(backPrompt, /旧会话已淘汰防分身/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

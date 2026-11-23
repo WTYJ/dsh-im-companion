@@ -59,6 +59,11 @@ export const DEFAULT_CONFIG = Object.freeze({
     enabled: false,
     preventDisplaySleep: false,
   }),
+  importantDates: Object.freeze({
+    enabled: true,
+    fileName: '重要日子.md',
+    windowDays: 30,
+  }),
 });
 
 function isRecord(value) {
@@ -95,6 +100,7 @@ export function normalizeConfig(raw = {}) {
   const ft = mergeSection(DEFAULT_CONFIG.fallbackTarget, src.fallbackTarget);
   const fg = mergeSection(DEFAULT_CONFIG.fileGuard, src.fileGuard);
   const ka = mergeSection(DEFAULT_CONFIG.keepAwake, src.keepAwake);
+  const idates = mergeSection(DEFAULT_CONFIG.importantDates, src.importantDates);
 
   const channels = Array.isArray(mb.channels)
     ? mb.channels.map((c) => String(c).trim().toLowerCase()).filter(Boolean)
@@ -163,6 +169,13 @@ export function normalizeConfig(raw = {}) {
       enabled: boolOr(ka.enabled, DEFAULT_CONFIG.keepAwake.enabled),
       preventDisplaySleep: boolOr(ka.preventDisplaySleep, DEFAULT_CONFIG.keepAwake.preventDisplaySleep),
     },
+    importantDates: {
+      enabled: boolOr(idates.enabled, DEFAULT_CONFIG.importantDates.enabled),
+      fileName: typeof idates.fileName === 'string' && idates.fileName.trim()
+        ? idates.fileName.trim()
+        : DEFAULT_CONFIG.importantDates.fileName,
+      windowDays: Math.floor(numOr(idates.windowDays, DEFAULT_CONFIG.importantDates.windowDays, { min: 1, max: 120 })),
+    },
   };
 }
 
@@ -181,6 +194,7 @@ export function resolveLiveConfig(baseConfig) {
       fallbackTarget: mergeSection(baseConfig.fallbackTarget, raw.fallbackTarget),
       fileGuard: mergeSection(baseConfig.fileGuard, raw.fileGuard),
       keepAwake: mergeSection(baseConfig.keepAwake, raw.keepAwake),
+      importantDates: mergeSection(baseConfig.importantDates, raw.importantDates),
       configFile: baseConfig.configFile,
     });
   } catch {

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -22,6 +22,7 @@ import {
 } from '../config.mjs';
 import { draftTargetFromConversation } from '../route.mjs';
 import { buildKeepAwakeCommand, createKeepAwakeManager } from '../keep-awake.mjs';
+import { parseImportantDatesMarkdown, resolveNextLunarOccurrence, scanImportantDates } from '../lunar.mjs';
 
 function makeMockCtx({ described = null } = {}) {
   const tools = new Map();
@@ -393,4 +394,69 @@ test('createKeepAwakeManager starts, is idempotent, restarts on mode change, and
   const sOff = mgr.apply({ enabled: false });
   assert.equal(sOff.active, false);
   assert.equal(spawned[1].killed, true);
+});
+
+test('importantDates accurately resolves lunar dates, 腊月小建 fallback, tool output, and prompt injection', async () => {
+  // 2025 lunar year 腊月 has 29 days -> 2026-02-16
+  const eve2025 = resolveNextLunarOccurrence({ month: 12, day: 30, isLeap: false }, '2026-02-10');
+  assert.equal(eve2025.dateIso, '2026-02-16');
+  assert.match(eve2025.note, /小建/);
+
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-im-dates-'));
+  try {
+    writeFileSync(
+      join(dir, '重要日子.md'),
+      [
+        '| 名称 | 历法 | 日期 | 提前提醒（天） | 备注 |',
+        '| --- | --- | --- | --- | --- |',
+        '| （示例）妈妈生日 | 农历 | 五月初八 | 7,3,1,0 | 示例行 |',
+        '| 姐姐生日 | 农历 | 十月十八 | 7,3,1,0 | 记得买礼物 |',
+        '| 主人的生日 | 公历 | 10-02 | 7,3,1,0 | 来自档案 |',
+      ].join('\n'),
+      'utf8',
+    );
+
+    const parsed = parseImportantDatesMarkdown(readFileSync(join(dir, '重要日子.md'), 'utf8'));
+    assert.equal(parsed.length, 2);
+
+    // 2026-11-23 is 农历十月十五 -> 十月十八 is 2026-11-26 (3 days later)
+    const nowTs = Date.parse('2026-11-23T15:00:00+08:00');
+    const scanned = scanImportantDates(dir, { fileName: '重要日子.md', windowDays: 30 }, nowTs);
+    assert.equal(scanned.fileFound, true);
+    assert.equal(scanned.todayIso, '2026-11-23');
+    assert.equal(scanned.todayLunarLabel, '十月十五');
+    assert.equal(scanned.upcoming.length, 1);
+    assert.equal(scanned.upcoming[0].name, '姐姐生日');
+    assert.equal(scanned.upcoming[0].nextDateIso, '2026-11-26');
+    assert.equal(scanned.alertItems.length, 1);
+
+    // Verify plugin tool + systemPrompt.context integration
+    const toolsMap = new Map();
+    const prompts = [];
+    const plugin = createCompanionPlugin({ nowFn: () => nowTs });
+    plugin.apply(
+      {
+        dshIm: {
+          describeConversationSync: () => ({ botId: 'bot1', channel: 'qq', conversationKey: 'c2c:123' }),
+        },
+        tools: { register: (t) => toolsMap.set(t.name, t) },
+        systemPrompt: { context: (c) => prompts.push(c) },
+      },
+      { configFile: false, keepAwake: { enabled: false }, importantDates: { enabled: true } },
+    );
+
+    const tool = toolsMap.get('im_list_important_dates');
+    assert.ok(tool);
+    const out = await tool.execute({}, { agent: { workspace: dir } });
+    assert.equal(out.enabled, true);
+    assert.equal(out.upcoming.length, 1);
+    assert.equal(out.upcoming[0].nextDateIso, '2026-11-26');
+
+    const guidance = prompts[0].text({ agent: { workspace: dir, session: { id: 's1', events: [] } } });
+    assert.match(guidance, /重要日子提醒/);
+    assert.match(guidance, /姐姐生日/);
+    assert.match(guidance, /2026-11-26/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

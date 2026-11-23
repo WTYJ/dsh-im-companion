@@ -11,10 +11,30 @@ import {
 } from './config.mjs';
 import { draftTargetFromConversation } from './route.mjs';
 import { createKeepAwakeManager } from './keep-awake.mjs';
+import { scanImportantDates } from './lunar.mjs';
 
 export const name = 'dsh-im-companion';
 export const inject = ['webServer'];
 export const SETTINGS_ROUTE = '/dsh-im-companion/settings';
+
+const PKG_META = (() => {
+  try {
+    const pkg = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8'));
+    return Object.freeze({
+      name: pkg.name || name,
+      version: pkg.version || '',
+      license: pkg.license || 'MIT',
+      homepage: pkg.homepage || 'https://github.com/WTYJ/dsh-im-companion',
+    });
+  } catch {
+    return Object.freeze({
+      name,
+      version: '',
+      license: 'MIT',
+      homepage: 'https://github.com/WTYJ/dsh-im-companion',
+    });
+  }
+})();
 
 const STICKER_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp']);
 
@@ -372,6 +392,7 @@ export function saveLiveConfig(baseConfig, patch = {}) {
     fallbackTarget: { ...current.fallbackTarget, ...(patch?.fallbackTarget ?? {}) },
     fileGuard: { ...current.fileGuard, ...(patch?.fileGuard ?? {}) },
     keepAwake: { ...current.keepAwake, ...(patch?.keepAwake ?? {}) },
+    importantDates: { ...current.importantDates, ...(patch?.importantDates ?? {}) },
     configFile: baseConfig.configFile,
   });
   if (baseConfig.configFile) {
@@ -385,6 +406,7 @@ export function saveLiveConfig(baseConfig, patch = {}) {
       fallbackTarget: next.fallbackTarget,
       fileGuard: next.fileGuard,
       keepAwake: next.keepAwake,
+      importantDates: next.importantDates,
     };
     writeFileSync(baseConfig.configFile, `${JSON.stringify(persisted, null, 2)}\n`, 'utf8');
   }
@@ -403,6 +425,7 @@ function mountSettingsHttp(webCtx, getBaseConfig, setRuntimeConfig, proactiveTra
           const cfg = resolveLiveConfig(getBaseConfig());
           sendJson(response, 200, {
             ok: true,
+            meta: PKG_META,
             settings: cfg,
             proactiveState: proactiveTracker.getState(),
             keepAwakeStatus: keepAwakeManager.getStatus(),
@@ -729,8 +752,90 @@ export function createCompanionPlugin({ sleepFn = sleep, random = Math.random, n
           },
         });
 
+        const listImportantDatesTool = Object.freeze({
+          name: 'im_list_important_dates',
+          description: 'Read workspace important dates (supports both solar and Chinese lunar calendar conversion) and return exact upcoming Gregorian dates and countdowns.',
+          parameters: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {},
+          },
+          output: {
+            schema: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                enabled: { type: 'boolean' },
+                fileFound: { type: 'boolean' },
+                fileName: { type: 'string' },
+                todayIso: { type: 'string' },
+                todayLunarLabel: { type: 'string' },
+                upcoming: {
+                  type: 'array',
+                  items: {
+                    type: 'object',
+                    properties: {
+                      name: { type: 'string' },
+                      calendar: { type: 'string' },
+                      dateRaw: { type: 'string' },
+                      nextDateIso: { type: 'string' },
+                      daysUntil: { type: 'number' },
+                      inAlertWindow: { type: 'boolean' },
+                      remark: { type: 'string' },
+                    },
+                    required: ['name', 'calendar', 'dateRaw', 'nextDateIso', 'daysUntil', 'inAlertWindow', 'remark'],
+                  },
+                },
+              },
+              required: ['enabled', 'fileFound', 'fileName', 'todayIso', 'todayLunarLabel', 'upcoming'],
+            },
+            render: (_args, value) => [{
+              type: 'text',
+              text: !value.enabled
+                ? 'Important dates feature is currently disabled.'
+                : !value.fileFound
+                  ? `今天北京时间 ${value.todayIso}（农历${value.todayLunarLabel}）；工作区未找到「${value.fileName}」。`
+                  : value.upcoming.length === 0
+                    ? `今天北京时间 ${value.todayIso}（农历${value.todayLunarLabel}）；近期没有临近的重要日子。`
+                    : `今天北京时间 ${value.todayIso}（农历${value.todayLunarLabel}）；临近重要日子：\n${value.upcoming.map((d) => `- ${d.name}：${d.nextDateIso}（${d.calendar === 'lunar' ? `农历${d.dateRaw}` : `公历${d.dateRaw}`}，${d.daysUntil === 0 ? '就是今天' : d.daysUntil === 1 ? '就在明天' : `还有 ${d.daysUntil} 天`}）${d.remark ? ` — ${d.remark}` : ''}`).join('\n')}`,
+            }],
+          },
+          async execute(_args, exec) {
+            const cfg = getConfig();
+            if (!cfg.enabled || !cfg.importantDates.enabled) {
+              return {
+                enabled: false,
+                fileFound: false,
+                fileName: cfg.importantDates.fileName,
+                todayIso: '',
+                todayLunarLabel: '',
+                upcoming: [],
+              };
+            }
+            const ws = workspaceOf(exec?.agent);
+            const result = scanImportantDates(ws, cfg.importantDates, nowFn());
+            return {
+              enabled: true,
+              fileFound: result.fileFound,
+              fileName: result.fileName,
+              todayIso: result.todayIso,
+              todayLunarLabel: result.todayLunarLabel,
+              upcoming: result.upcoming.map((d) => ({
+                name: d.name,
+                calendar: d.calendar,
+                dateRaw: d.dateRaw,
+                nextDateIso: d.nextDateIso,
+                daysUntil: d.daysUntil,
+                inAlertWindow: d.inAlertWindow,
+                remark: [d.calendarNote, d.remark].filter(Boolean).join('；'),
+              })),
+            };
+          },
+        });
+
         tools.register(sendBubblesTool);
         tools.register(listStickersTool);
+        tools.register(listImportantDatesTool);
 
         systemPrompt.context({
           name: 'dsh-im-companion:guidance',
@@ -802,6 +907,29 @@ export function createCompanionPlugin({ sleepFn = sleep, random = Math.random, n
                 lines.push(
                   `IM 表情包已开启：情绪到位时偶尔可调用 im_list_stickers 查看「${cfg.sticker.dirName}/」里的图，选一张最贴合语境的通过 dsh_im_return_file 发送；每次最多发一张，发完照常说话，不要连着甩图。`,
                 );
+              }
+            }
+
+            if (cfg.importantDates.enabled) {
+              const idResult = scanImportantDates(ws, cfg.importantDates, nowFn());
+              if (idResult.fileFound) {
+                if (idResult.alertItems.length > 0) {
+                  const summary = idResult.alertItems
+                    .map((d) => {
+                      const cal = d.calendar === 'lunar' ? `农历${d.dateRaw}` : `公历${d.dateRaw}`;
+                      const when = d.daysUntil === 0 ? '就是今天！' : d.daysUntil === 1 ? '就在明天！' : `还有 ${d.daysUntil} 天（${d.nextDateIso}）`;
+                      const note = [d.calendarNote, d.remark].filter(Boolean).join('；');
+                      return `${d.name}（${cal} → ${when}${note ? `，${note}` : ''}）`;
+                    })
+                    .join('；');
+                  lines.push(
+                    `重要日子提醒（今天北京时间 ${idResult.todayIso}，农历${idResult.todayLunarLabel}，来源「${idResult.fileName}」）：${summary}。请在合适时机用自然亲近的口吻温柔提醒，避免同一条每轮反复刷屏；也可随时调用 im_list_important_dates 查未来 ${cfg.importantDates.windowDays} 天精确换算结果。`,
+                  );
+                } else {
+                  lines.push(
+                    `重要日子与农历助手已开启（今天北京时间 ${idResult.todayIso}，农历${idResult.todayLunarLabel}，来源「${idResult.fileName}」）：未来几天暂无进入提醒窗口的日子，需要精确换算农历或查近期生日/纪念日时请调用 im_list_important_dates，不要自己心算农历。`,
+                  );
+                }
               }
             }
 

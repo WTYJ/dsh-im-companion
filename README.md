@@ -30,6 +30,11 @@
 7. **防系统自动休眠保活（Keep Awake）**
    - 零依赖调用系统原生保活机制（macOS 使用 `/usr/bin/caffeinate -i -s -w <pid>`，Windows 使用 `SetThreadExecutionState`，Linux 使用 `systemd-inhibit`），防止电脑挂机时自动休眠导致机器人断网离线。
    - 默认允许显示器熄灭以省电（也可按需开启防熄屏）；开关关闭或 DSH 退出时自动释放，绝不残留僵尸进程。
+8. **重要日子与农历提醒（Important Dates & Lunar）**
+   - 零依赖调用 V8 原生中国农历历法（`zh-CN-u-ca-chinese`），解析工作区重要日子清单（默认 `重要日子.md`），精确换算公历与农历日期（完整支持闰月与腊月小建 29 天自动按廿九/除夕回落），彻底避免大模型心算农历出错。
+   - 自动将今日北京时间（公历 + 农历）与命中提醒窗口的生日/纪念日注入提示词上下文，并注册 `im_list_important_dates` 工具供模型随时查询精确倒计时；清单文件不存在时自动静默。
+
+设置面板底部另提供 **「ℹ️ 关于」** 信息卡片，动态展示当前版本、协议与仓库地址。
 
 ---
 
@@ -46,7 +51,7 @@ dsh plugin add github:WTYJ/dsh-im-companion
 ```
 
 ### 方式二：本地目录安装 / 开发
-在 `%USERPROFILE%\.dsh\profiles\desktop\package.json` 的 `dependencies` 与 `dsh.profile.bundles` 中加入 `dsh-im-companion`，或使用：
+在 `~/.dsh/profiles/desktop/package.json`（Windows 为 `%USERPROFILE%\.dsh\profiles\desktop\package.json`）的 `dependencies` 与 `dsh.profile.bundles` 中加入 `dsh-im-companion`，或使用：
 ```bash
 dsh plugin add file:/path/to/dsh-im-companion
 ```

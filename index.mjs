@@ -10,6 +10,7 @@ import {
   resolveLiveConfig,
 } from './config.mjs';
 import { draftTargetFromConversation } from './route.mjs';
+import { createKeepAwakeManager } from './keep-awake.mjs';
 
 export const name = 'dsh-im-companion';
 export const inject = ['webServer'];
@@ -370,6 +371,7 @@ export function saveLiveConfig(baseConfig, patch = {}) {
     proactiveGuard: { ...current.proactiveGuard, ...(patch?.proactiveGuard ?? {}) },
     fallbackTarget: { ...current.fallbackTarget, ...(patch?.fallbackTarget ?? {}) },
     fileGuard: { ...current.fileGuard, ...(patch?.fileGuard ?? {}) },
+    keepAwake: { ...current.keepAwake, ...(patch?.keepAwake ?? {}) },
     configFile: baseConfig.configFile,
   });
   if (baseConfig.configFile) {
@@ -382,6 +384,7 @@ export function saveLiveConfig(baseConfig, patch = {}) {
       proactiveGuard: next.proactiveGuard,
       fallbackTarget: next.fallbackTarget,
       fileGuard: next.fileGuard,
+      keepAwake: next.keepAwake,
     };
     writeFileSync(baseConfig.configFile, `${JSON.stringify(persisted, null, 2)}\n`, 'utf8');
   }
@@ -389,7 +392,7 @@ export function saveLiveConfig(baseConfig, patch = {}) {
   return next;
 }
 
-function mountSettingsHttp(webCtx, getBaseConfig, setRuntimeConfig, proactiveTracker, logger) {
+function mountSettingsHttp(webCtx, getBaseConfig, setRuntimeConfig, proactiveTracker, keepAwakeManager, logger) {
   if (typeof webCtx?.webServer?.register !== 'function') return;
   const registerRoute = () => webCtx.webServer.register({
     kind: 'exact',
@@ -402,6 +405,7 @@ function mountSettingsHttp(webCtx, getBaseConfig, setRuntimeConfig, proactiveTra
             ok: true,
             settings: cfg,
             proactiveState: proactiveTracker.getState(),
+            keepAwakeStatus: keepAwakeManager.getStatus(),
           });
           return;
         }
@@ -413,15 +417,18 @@ function mountSettingsHttp(webCtx, getBaseConfig, setRuntimeConfig, proactiveTra
               ok: true,
               settings: resolveLiveConfig(getBaseConfig()),
               proactiveState: resetState,
+              keepAwakeStatus: keepAwakeManager.getStatus(),
             });
             return;
           }
           const updated = saveLiveConfig(getBaseConfig(), body);
           setRuntimeConfig(updated);
+          const kaStatus = keepAwakeManager.apply(updated.enabled ? updated.keepAwake : { enabled: false });
           sendJson(response, 200, {
             ok: true,
             settings: updated,
             proactiveState: proactiveTracker.getState(),
+            keepAwakeStatus: kaStatus,
           });
           return;
         }
@@ -491,7 +498,7 @@ export function installSessionEventObserver(eventCtx, proactiveTracker, getConfi
   }, { global: true });
 }
 
-export function createCompanionPlugin({ sleepFn = sleep, random = Math.random, nowFn = Date.now } = {}) {
+export function createCompanionPlugin({ sleepFn = sleep, random = Math.random, nowFn = Date.now, keepAwakeFactory = createKeepAwakeManager } = {}) {
   return Object.freeze({
     name,
     inject,
@@ -504,16 +511,23 @@ export function createCompanionPlugin({ sleepFn = sleep, random = Math.random, n
         stateFile: stateFilePathFrom(baseConfig),
         nowFn,
       });
+      const keepAwakeManager = keepAwakeFactory({ logger });
 
       const getConfig = () => resolveLiveConfig(baseConfig);
       const setRuntimeConfig = (updated) => { baseConfig = updated; };
       const getTurnKey = (sessionId, agent) => `${sessionId}\u0000${currentTurnOf(agent)}`;
 
-      // Apply file guard at startup
-      applyFileGuard(getConfig().fileGuard);
+      // Apply file guard & keep-awake at startup
+      const initialCfg = getConfig();
+      applyFileGuard(initialCfg.fileGuard);
+      keepAwakeManager.apply(initialCfg.enabled ? initialCfg.keepAwake : { enabled: false });
+
+      if (typeof ctx?.effect === 'function') {
+        ctx.effect(() => () => keepAwakeManager.stop(), `${name}: keep-awake cleanup`);
+      }
 
       // 1. Mount HTTP settings endpoint immediately on root `webServer`
-      mountSettingsHttp(ctx, () => baseConfig, setRuntimeConfig, proactiveTracker, logger);
+      mountSettingsHttp(ctx, () => baseConfig, setRuntimeConfig, proactiveTracker, keepAwakeManager, logger);
 
       // 2. Mount global `session/event` observer for 100% accurate proactive/user tracking
       if (typeof ctx?.on === 'function') {

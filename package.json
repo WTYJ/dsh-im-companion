@@ -1,6 +1,6 @@
 {
   "name": "dsh-im-companion",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "DSH (@xmanrui/dsh-im) 独立伴生增强插件，提供分气泡连发、拟人打字延迟、主动消息熔断与睡眠免打扰顺延、核心文件只读锁及独立可视化开关。",
   "keywords": [
     "deepseek-harness",
@@ -37,6 +37,7 @@
     "index.mjs",
     "config.mjs",
     "route.mjs",
+    "keep-awake.mjs",
     "lib/client.js",
     "cordis.patch.yml",
     "README.md",

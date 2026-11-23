@@ -21,6 +21,7 @@ import {
   normalizeConfig,
 } from '../config.mjs';
 import { draftTargetFromConversation } from '../route.mjs';
+import { buildKeepAwakeCommand, createKeepAwakeManager } from '../keep-awake.mjs';
 
 function makeMockCtx({ described = null } = {}) {
   const tools = new Map();
@@ -336,4 +337,60 @@ test('resolveDeliveryRoute falls back to saved QQ target when session is unbound
     targetOrDraft: 'daily-qq',
     usedFallback: true,
   });
+});
+
+test('buildKeepAwakeCommand generates native macOS and Windows commands', () => {
+  const mac = buildKeepAwakeCommand({ platform: 'darwin', pid: 4321, preventDisplaySleep: false });
+  assert.equal(mac.command, '/usr/bin/caffeinate');
+  assert.deepEqual(mac.args, ['-i', '-s', '-w', '4321']);
+
+  const macDisplay = buildKeepAwakeCommand({ platform: 'darwin', pid: 4321, preventDisplaySleep: true });
+  assert.deepEqual(macDisplay.args, ['-i', '-s', '-d', '-w', '4321']);
+
+  const win = buildKeepAwakeCommand({ platform: 'win32', pid: 100, preventDisplaySleep: false });
+  assert.equal(win.command, 'powershell.exe');
+  assert.ok(win.args.some((a) => a.includes('SetThreadExecutionState')));
+});
+
+test('createKeepAwakeManager starts, is idempotent, restarts on mode change, and stops cleanly', () => {
+  const spawned = [];
+  let nextPid = 5000;
+  const fakeSpawn = (cmd, args) => {
+    const proc = {
+      pid: nextPid++,
+      cmd,
+      args,
+      killed: false,
+      unrefCalled: false,
+      on() {},
+      unref() { this.unrefCalled = true; },
+      kill() { this.killed = true; },
+    };
+    spawned.push(proc);
+    return proc;
+  };
+
+  const mgr = createKeepAwakeManager({ platform: 'darwin', pid: 999, spawnFn: fakeSpawn });
+  assert.equal(mgr.getStatus().active, false);
+
+  // Enable system keep-awake
+  const s1 = mgr.apply({ enabled: true, preventDisplaySleep: false });
+  assert.equal(s1.active, true);
+  assert.equal(spawned.length, 1);
+  assert.equal(spawned[0].unrefCalled, true);
+
+  // Applying identical config does not spawn duplicate process
+  mgr.apply({ enabled: true, preventDisplaySleep: false });
+  assert.equal(spawned.length, 1);
+
+  // Toggling preventDisplaySleep kills old process and spawns new one with -d
+  mgr.apply({ enabled: true, preventDisplaySleep: true });
+  assert.equal(spawned.length, 2);
+  assert.equal(spawned[0].killed, true);
+  assert.ok(spawned[1].args.includes('-d'));
+
+  // Disabling stops process cleanly
+  const sOff = mgr.apply({ enabled: false });
+  assert.equal(sOff.active, false);
+  assert.equal(spawned[1].killed, true);
 });

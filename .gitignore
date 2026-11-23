@@ -1,4 +1,5 @@
 node_modules/
+AGENTS.md
 companion-settings.json
 proactive-state.json
 *.bak

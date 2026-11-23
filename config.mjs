@@ -55,6 +55,10 @@ export const DEFAULT_CONFIG = Object.freeze({
     workspaceDirs: [],
     protectedFiles: ['AGENTS.md', '关于他.md'],
   }),
+  keepAwake: Object.freeze({
+    enabled: false,
+    preventDisplaySleep: false,
+  }),
 });
 
 function isRecord(value) {
@@ -90,6 +94,7 @@ export function normalizeConfig(raw = {}) {
   const pg = mergeSection(DEFAULT_CONFIG.proactiveGuard, src.proactiveGuard);
   const ft = mergeSection(DEFAULT_CONFIG.fallbackTarget, src.fallbackTarget);
   const fg = mergeSection(DEFAULT_CONFIG.fileGuard, src.fileGuard);
+  const ka = mergeSection(DEFAULT_CONFIG.keepAwake, src.keepAwake);
 
   const channels = Array.isArray(mb.channels)
     ? mb.channels.map((c) => String(c).trim().toLowerCase()).filter(Boolean)
@@ -154,6 +159,10 @@ export function normalizeConfig(raw = {}) {
       workspaceDirs,
       protectedFiles,
     },
+    keepAwake: {
+      enabled: boolOr(ka.enabled, DEFAULT_CONFIG.keepAwake.enabled),
+      preventDisplaySleep: boolOr(ka.preventDisplaySleep, DEFAULT_CONFIG.keepAwake.preventDisplaySleep),
+    },
   };
 }
 
@@ -171,6 +180,7 @@ export function resolveLiveConfig(baseConfig) {
       proactiveGuard: mergeSection(baseConfig.proactiveGuard, raw.proactiveGuard),
       fallbackTarget: mergeSection(baseConfig.fallbackTarget, raw.fallbackTarget),
       fileGuard: mergeSection(baseConfig.fileGuard, raw.fileGuard),
+      keepAwake: mergeSection(baseConfig.keepAwake, raw.keepAwake),
       configFile: baseConfig.configFile,
     });
   } catch {

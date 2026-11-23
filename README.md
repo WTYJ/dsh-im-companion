@@ -27,6 +27,9 @@
    - 当后台定时任务或冷会话无法通过 `sessionId` 获取当前绑定路由时，自动通过 `dshIm.listBots()` + `dshIm.listTargets()` 回退到已保存的默认投递目标发送。
 6. **表情包助手（Sticker Helper）**
    - 自动扫描工作区 `表情/` 文件夹（忽略 `_` 开头文件），注册 `im_list_stickers` 配合官方 `dsh_im_return_file` 发送梗图；目录为空或不存在时自动静默，不污染提示词。
+7. **防系统自动休眠保活（Keep Awake）**
+   - 零依赖调用系统原生保活机制（macOS 使用 `/usr/bin/caffeinate -i -s -w <pid>`，Windows 使用 `SetThreadExecutionState`，Linux 使用 `systemd-inhibit`），防止电脑挂机时自动休眠导致机器人断网离线。
+   - 默认允许显示器熄灭以省电（也可按需开启防熄屏）；开关关闭或 DSH 退出时自动释放，绝不残留僵尸进程。
 
 ---
 

@@ -8,6 +8,7 @@ import {
   applyFileGuard,
   createCompanionPlugin,
   createProactiveStateTracker,
+  installPreReplyPauseMiddleware,
   installSessionEventObserver,
   resolveDeliveryRoute,
   saveLiveConfig,
@@ -16,6 +17,8 @@ import {
 import {
   beijingDateParts,
   computeNextProactiveTimestamp,
+  computePreReplyPauseMs,
+  computeTailPauseMs,
   computeTypingDelayMs,
   isInQuietHours,
   normalizeConfig,
@@ -110,7 +113,8 @@ test('im_send_bubbles sends leading bubbles, deduplicates repeats, and respects 
   assert.equal(sent.length, 2);
   assert.equal(sent[0].text, '第一句');
   assert.equal(sent[1].text, '第二句');
-  assert.equal(sleeps.length, 2);
+  // Full delay for bubble #1 (no 0.5x cut) + full delay for bubble #2 + tail pause before final reply
+  assert.deepEqual(sleeps, [550, 550, 500]);
 
   // Calling again in same turn hits cap
   const res2 = await bubbleTool.execute(
@@ -459,4 +463,81 @@ test('importantDates accurately resolves lunar dates, 腊月小建 fallback, too
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('tailPause and preReplyPause switches work and pre-step middleware only delays IM user turns', async () => {
+  const cfg = normalizeConfig({
+    typingDelay: {
+      enabled: true,
+      baseDelayMs: 900,
+      minDelayMs: 1200,
+      maxDelayMs: 5500,
+      jitterRatio: 0,
+      tailPauseEnabled: true,
+      preReplyPauseEnabled: true,
+      preReplyMinMs: 1200,
+      preReplyMaxMs: 2400,
+    },
+  });
+  assert.equal(computeTailPauseMs(cfg.typingDelay, () => 0.5), 1200);
+  assert.equal(computePreReplyPauseMs(cfg.typingDelay, () => 0.5), 1800);
+  assert.equal(computeTailPauseMs({ ...cfg.typingDelay, tailPauseEnabled: false }), 0);
+  assert.equal(computePreReplyPauseMs({ ...cfg.typingDelay, preReplyPauseEnabled: false }), 0);
+
+  let registeredHandler = null;
+  const eventCtx = {
+    on(eventName, fn) {
+      if (eventName === 'agent/pre-step') registeredHandler = fn;
+      return () => { registeredHandler = null; };
+    },
+  };
+  const dshIm = {
+    describeConversationSync(sid) {
+      return sid === 'im-sess' ? { botId: 'bot1', channel: 'qq', conversationKey: 'c2c:U1' } : null;
+    },
+  };
+
+  let liveCfg = cfg;
+  const sleeps = [];
+  installPreReplyPauseMiddleware(eventCtx, dshIm, () => liveCfg, {
+    sleepFn: async (ms) => { sleeps.push(ms); },
+    random: () => 0.5,
+  });
+  assert.ok(registeredHandler);
+
+  // 1. Desktop (non-IM) session: skipped (0 sleep)
+  await registeredHandler(
+    { agent: { session: { id: 'desktop-sess' } } },
+    async () => ({ kind: 'enter', messages: [{ id: 'm1', source: { kind: 'user' } }] }),
+  );
+  assert.equal(sleeps.length, 0);
+
+  // 2. Scheduled proactive turn on IM session: skipped
+  await registeredHandler(
+    { agent: { session: { id: 'im-sess' } } },
+    async () => ({ kind: 'enter', messages: [{ id: 'm2', source: { kind: 'schedule' } }] }),
+  );
+  assert.equal(sleeps.length, 0);
+
+  // 3. Real user message on IM session: pauses once
+  await registeredHandler(
+    { agent: { session: { id: 'im-sess' } } },
+    async () => ({ kind: 'enter', messages: [{ id: 'm3', source: { kind: 'user' } }] }),
+  );
+  assert.deepEqual(sleeps, [1800]);
+
+  // 4. Duplicate pre-step for same message batch: deduplicated (no double sleep)
+  await registeredHandler(
+    { agent: { session: { id: 'im-sess' } } },
+    async () => ({ kind: 'enter', messages: [{ id: 'm3', source: { kind: 'user' } }] }),
+  );
+  assert.deepEqual(sleeps, [1800]);
+
+  // 5. Disabling preReplyPauseEnabled switch stops pausing immediately
+  liveCfg = normalizeConfig({ typingDelay: { preReplyPauseEnabled: false } });
+  await registeredHandler(
+    { agent: { session: { id: 'im-sess' } } },
+    async () => ({ kind: 'enter', messages: [{ id: 'm4', source: { kind: 'user' } }] }),
+  );
+  assert.deepEqual(sleeps, [1800]);
 });

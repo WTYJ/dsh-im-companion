@@ -4,6 +4,8 @@ import { dirname, extname, join } from 'node:path';
 import {
   beijingDateParts,
   computeNextProactiveTimestamp,
+  computePreReplyPauseMs,
+  computeTailPauseMs,
   computeTypingDelayMs,
   isInQuietHours,
   normalizeConfig,
@@ -521,6 +523,63 @@ export function installSessionEventObserver(eventCtx, proactiveTracker, getConfi
   }, { global: true });
 }
 
+/**
+ * Add a natural pre-reply pause on IM-bound user turns via DSH's `agent/pre-step`
+ * middleware so single-bubble replies do not fire instantaneously.
+ * Strictly skips non-IM (desktop) sessions, scheduled proactive turns, and tool follow-ups.
+ */
+export function installPreReplyPauseMiddleware(eventCtx, dshIm, getConfig, { sleepFn = sleep, random = Math.random } = {}) {
+  if (typeof eventCtx?.on !== 'function' || typeof dshIm?.describeConversationSync !== 'function') {
+    return null;
+  }
+  const seenBatchKeys = new Set();
+
+  return eventCtx.on('agent/pre-step', async (payload, next) => {
+    const decision = typeof next === 'function' ? await next() : payload;
+    if (decision?.kind !== 'enter') return decision;
+
+    const cfg = getConfig();
+    if (!cfg?.enabled || !cfg?.typingDelay?.enabled || !cfg?.typingDelay?.preReplyPauseEnabled) {
+      return decision;
+    }
+
+    const agent = payload?.agent;
+    const sessionId = sessionIdOf(agent?.session);
+    if (!sessionId) return decision;
+
+    let described = null;
+    try {
+      described = dshIm.describeConversationSync(sessionId);
+    } catch {
+      return decision;
+    }
+    if (!described?.botId) return decision;
+
+    const messages = Array.isArray(decision.messages) ? decision.messages : [];
+    const userMsgs = messages.filter((m) => m?.source?.kind === 'user' || m?.source === undefined);
+    if (userMsgs.length === 0) return decision;
+
+    const batchId = userMsgs.map((m) => m?.id ?? '').filter(Boolean).join(',') || `turn:${currentTurnOf(agent)}`;
+    const key = `${sessionId}\u0000${batchId}`;
+    if (seenBatchKeys.has(key)) return decision;
+    seenBatchKeys.add(key);
+    if (seenBatchKeys.size > 200) {
+      const oldest = seenBatchKeys.values().next().value;
+      if (oldest !== undefined) seenBatchKeys.delete(oldest);
+    }
+
+    const pauseMs = computePreReplyPauseMs(cfg.typingDelay, random);
+    if (pauseMs > 0) {
+      try {
+        await sleepFn(pauseMs, payload?.signal ?? agent?.signal);
+      } catch {
+        // Ignore abort errors cleanly so DSH handles cancellation normally
+      }
+    }
+    return decision;
+  }, { global: true });
+}
+
 export function createCompanionPlugin({ sleepFn = sleep, random = Math.random, nowFn = Date.now, keepAwakeFactory = createKeepAwakeManager } = {}) {
   return Object.freeze({
     name,
@@ -672,9 +731,7 @@ export function createCompanionPlugin({ sleepFn = sleep, random = Math.random, n
             const sentMessages = [];
             for (let i = 0; i < deduped.length; i += 1) {
               const text = deduped[i];
-              const delayMs = i === 0
-                ? Math.round(computeTypingDelayMs(text, cfg.typingDelay, random) * 0.5)
-                : computeTypingDelayMs(text, cfg.typingDelay, random);
+              const delayMs = computeTypingDelayMs(text, cfg.typingDelay, random);
               await sleepFn(delayMs, exec?.signal);
               const result = await dshIm.send(routeInfo.botId, routeInfo.targetOrDraft, text, {
                 signal: exec?.signal,
@@ -686,6 +743,11 @@ export function createCompanionPlugin({ sleepFn = sleep, random = Math.random, n
               sentCount += 1;
               sentMessages.push(text);
               turnBubbleCounts.set(turnKey, alreadySent + sentCount);
+            }
+
+            const tailPauseMs = computeTailPauseMs(cfg.typingDelay, random);
+            if (tailPauseMs > 0) {
+              await sleepFn(tailPauseMs, exec?.signal);
             }
 
             if (turnBubbleCounts.size > 200) {
@@ -836,6 +898,18 @@ export function createCompanionPlugin({ sleepFn = sleep, random = Math.random, n
         tools.register(sendBubblesTool);
         tools.register(listStickersTool);
         tools.register(listImportantDatesTool);
+
+        // Mount IM-only pre-reply pause middleware for single-bubble replies
+        const preReplyCtx = typeof toolCtx?.on === 'function' ? toolCtx : ctx;
+        if (typeof preReplyCtx?.on === 'function') {
+          const disposePreReply = installPreReplyPauseMiddleware(preReplyCtx, dshIm, getConfig, {
+            sleepFn,
+            random,
+          });
+          if (disposePreReply && typeof preReplyCtx?.effect === 'function') {
+            preReplyCtx.effect(() => disposePreReply, `${name}: pre-reply pause`);
+          }
+        }
 
         systemPrompt.context({
           name: 'dsh-im-companion:guidance',

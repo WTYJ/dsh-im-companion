@@ -25,12 +25,16 @@ export const DEFAULT_CONFIG = Object.freeze({
   }),
   typingDelay: Object.freeze({
     enabled: true,
-    baseDelayMs: 450,
-    msPerChar: 65,
-    minDelayMs: 600,
-    maxDelayMs: 2200,
-    jitterRatio: 0.15,
+    baseDelayMs: 900,
+    msPerChar: 180,
+    minDelayMs: 1200,
+    maxDelayMs: 5500,
+    jitterRatio: 0.2,
     rateLimitFloorMs: 250,
+    tailPauseEnabled: true,
+    preReplyPauseEnabled: true,
+    preReplyMinMs: 1200,
+    preReplyMaxMs: 2400,
   }),
   sticker: Object.freeze({
     enabled: true,
@@ -108,6 +112,8 @@ export function normalizeConfig(raw = {}) {
 
   const minDelayMs = numOr(td.minDelayMs, DEFAULT_CONFIG.typingDelay.minDelayMs, { min: 0, max: 30_000 });
   const maxDelayMs = numOr(td.maxDelayMs, DEFAULT_CONFIG.typingDelay.maxDelayMs, { min: minDelayMs, max: 60_000 });
+  const preReplyMinMs = numOr(td.preReplyMinMs, DEFAULT_CONFIG.typingDelay.preReplyMinMs, { min: 0, max: 15_000 });
+  const preReplyMaxMs = numOr(td.preReplyMaxMs, DEFAULT_CONFIG.typingDelay.preReplyMaxMs, { min: preReplyMinMs, max: 30_000 });
 
   const workspaceDirs = Array.isArray(fg.workspaceDirs)
     ? fg.workspaceDirs.map((d) => String(d ?? '').trim()).filter(Boolean)
@@ -139,6 +145,10 @@ export function normalizeConfig(raw = {}) {
       maxDelayMs,
       jitterRatio: numOr(td.jitterRatio, DEFAULT_CONFIG.typingDelay.jitterRatio, { min: 0, max: 0.5 }),
       rateLimitFloorMs: numOr(td.rateLimitFloorMs, DEFAULT_CONFIG.typingDelay.rateLimitFloorMs, { min: 0, max: 5000 }),
+      tailPauseEnabled: boolOr(td.tailPauseEnabled, DEFAULT_CONFIG.typingDelay.tailPauseEnabled),
+      preReplyPauseEnabled: boolOr(td.preReplyPauseEnabled, DEFAULT_CONFIG.typingDelay.preReplyPauseEnabled),
+      preReplyMinMs,
+      preReplyMaxMs,
     },
     sticker: {
       enabled: boolOr(st.enabled, DEFAULT_CONFIG.sticker.enabled),
@@ -213,6 +223,28 @@ export function computeTypingDelayMs(text, typingConfig, random = Math.random) {
   if (ratio <= 0) return Math.round(clamped);
   const factor = 1 + (random() * 2 - 1) * ratio;
   return Math.max(0, Math.round(clamped * factor));
+}
+
+export function computeTailPauseMs(typingConfig, random = Math.random) {
+  if (!typingConfig?.enabled || !typingConfig?.tailPauseEnabled) {
+    return 0;
+  }
+  const base = Math.max(typingConfig.minDelayMs ?? 1200, typingConfig.baseDelayMs ?? 900);
+  const max = typingConfig.maxDelayMs ?? 5500;
+  const clamped = Math.min(max, Math.max(typingConfig.rateLimitFloorMs ?? 250, base));
+  const ratio = typingConfig.jitterRatio ?? 0;
+  if (ratio <= 0) return Math.round(clamped);
+  const factor = 1 + (random() * 2 - 1) * ratio;
+  return Math.max(0, Math.round(clamped * factor));
+}
+
+export function computePreReplyPauseMs(typingConfig, random = Math.random) {
+  if (!typingConfig?.enabled || !typingConfig?.preReplyPauseEnabled) {
+    return 0;
+  }
+  const min = Math.max(0, typingConfig.preReplyMinMs ?? 1200);
+  const max = Math.max(min, typingConfig.preReplyMaxMs ?? 2400);
+  return Math.round(min + random() * (max - min));
 }
 
 export function parseHhMmToMinutes(hhmm) {

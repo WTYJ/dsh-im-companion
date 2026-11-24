@@ -104,6 +104,35 @@ export function classifyCurrentTurn(agent) {
   return 'user';
 }
 
+/**
+ * Detect whether the model's most recent casual assistant reply packed multiple
+ * short paragraphs into a single bubble via blank lines (`\n\n`) instead of
+ * calling `im_send_bubbles`, so we can inject a gentle one-turn drift reminder.
+ */
+export function detectMultiBubbleDrift(agent) {
+  const events = snapshotEventsOf(agent);
+  for (let i = events.length - 1; i >= 0; i -= 1) {
+    const ev = events[i];
+    if (ev?.type !== 'assistant/message') continue;
+    const content = ev.data?.message?.content;
+    if (!Array.isArray(content)) continue;
+    const text = content
+      .filter((c) => c?.type === 'text' && typeof c.text === 'string' && c.text.trim())
+      .map((c) => c.text.trim())
+      .join('\n')
+      .trim();
+    if (!text) continue;
+    if (!/\n\s*\n/.test(text)) return false;
+    // Ignore structured technical/long-form replies (code blocks, markdown lists/headings, long essays)
+    if (text.length > 260) return false;
+    if (text.includes('```')) return false;
+    if (/^\s*(#{1,6}\s|[-*•]\s|\d+[.)、]\s)/m.test(text)) return false;
+    const paras = text.split(/\n\s*\n/).map((p) => p.trim()).filter(Boolean);
+    return paras.length >= 2 && paras.length <= 4;
+  }
+  return false;
+}
+
 function stateFilePathFrom(baseConfig) {
   if (!baseConfig?.configFile) return null;
   return join(dirname(baseConfig.configFile), 'proactive-state.json');
@@ -422,7 +451,16 @@ export function saveLiveConfig(baseConfig, patch = {}) {
   return next;
 }
 
-function mountSettingsHttp(webCtx, getBaseConfig, setRuntimeConfig, proactiveTracker, keepAwakeManager, supersededTracker, logger) {
+function mountSettingsHttp(
+  webCtx,
+  getBaseConfig,
+  setRuntimeConfig,
+  proactiveTracker,
+  keepAwakeManager,
+  supersededTracker,
+  logger,
+  getLastBubbleTrace = () => null,
+) {
   if (typeof webCtx?.webServer?.register !== 'function') return;
   const registerRoute = () => webCtx.webServer.register({
     kind: 'exact',
@@ -438,6 +476,7 @@ function mountSettingsHttp(webCtx, getBaseConfig, setRuntimeConfig, proactiveTra
             proactiveState: proactiveTracker.getState(),
             keepAwakeStatus: keepAwakeManager.getStatus(),
             sessionSwitchState: supersededTracker.getState(),
+            lastBubbleTrace: getLastBubbleTrace(),
           });
           return;
         }
@@ -451,6 +490,17 @@ function mountSettingsHttp(webCtx, getBaseConfig, setRuntimeConfig, proactiveTra
               proactiveState: resetState,
               keepAwakeStatus: keepAwakeManager.getStatus(),
               sessionSwitchState: supersededTracker.getState(),
+              lastBubbleTrace: getLastBubbleTrace(),
+            });
+            return;
+          }
+          if (body?.action === 'sleepDisplayNow') {
+            const result = typeof keepAwakeManager?.sleepDisplayNow === 'function'
+              ? keepAwakeManager.sleepDisplayNow({ delayMs: body?.delayMs ?? 0 })
+              : { ok: false, error: 'sleep-display-unavailable' };
+            sendJson(response, result.ok ? 200 : 400, {
+              ...result,
+              keepAwakeStatus: keepAwakeManager.getStatus(),
             });
             return;
           }
@@ -463,6 +513,7 @@ function mountSettingsHttp(webCtx, getBaseConfig, setRuntimeConfig, proactiveTra
             proactiveState: proactiveTracker.getState(),
             keepAwakeStatus: kaStatus,
             sessionSwitchState: supersededTracker.getState(),
+            lastBubbleTrace: getLastBubbleTrace(),
           });
           return;
         }
@@ -537,8 +588,25 @@ export function installSessionEventObserver(eventCtx, proactiveTracker, getConfi
  * middleware so single-bubble replies do not fire instantaneously.
  * Strictly skips non-IM (desktop) sessions, scheduled proactive turns, and tool follow-ups.
  */
-export function installPreReplyPauseMiddleware(eventCtx, dshIm, getConfig, { sleepFn = sleep, random = Math.random } = {}) {
-  if (typeof eventCtx?.on !== 'function' || typeof dshIm?.describeConversationSync !== 'function') {
+function cacheSessionBinding(bindingCache, sessionId, described) {
+  if (!bindingCache || !sessionId || !described?.botId) return;
+  bindingCache.set(sessionId, described);
+  if (bindingCache.size > 200) {
+    const oldest = bindingCache.keys().next().value;
+    if (oldest !== undefined) bindingCache.delete(oldest);
+  }
+}
+
+export function installPreReplyPauseMiddleware(
+  eventCtx,
+  dshIm,
+  getConfig,
+  { sleepFn = sleep, random = Math.random, bindingCache = null } = {},
+) {
+  if (
+    typeof eventCtx?.on !== 'function'
+    || (typeof dshIm?.describeConversation !== 'function' && typeof dshIm?.describeConversationSync !== 'function')
+  ) {
     return null;
   }
   const seenBatchKeys = new Set();
@@ -557,10 +625,25 @@ export function installPreReplyPauseMiddleware(eventCtx, dshIm, getConfig, { sle
     if (!sessionId) return decision;
 
     let described = null;
-    try {
-      described = dshIm.describeConversationSync(sessionId);
-    } catch {
-      return decision;
+    if (typeof dshIm?.describeConversationSync === 'function') {
+      try {
+        described = dshIm.describeConversationSync(sessionId);
+      } catch {
+        described = null;
+      }
+    }
+    if (!described?.botId && bindingCache?.has(sessionId)) {
+      described = bindingCache.get(sessionId);
+    }
+    if (!described?.botId && typeof dshIm?.describeConversation === 'function') {
+      try {
+        described = await dshIm.describeConversation(sessionId);
+        if (described?.botId) {
+          cacheSessionBinding(bindingCache, sessionId, described);
+        }
+      } catch {
+        described = null;
+      }
     }
     if (!described?.botId) return decision;
 
@@ -719,10 +802,19 @@ export function createSupersededSessionTracker({
   };
 }
 
-export function installSessionBindingGuard(eventCtx, supersededTracker, getConfig, logger) {
+export function installSessionBindingGuard(
+  eventCtx,
+  supersededTracker,
+  getConfig,
+  logger,
+  { bindingCache = null } = {},
+) {
   if (typeof eventCtx?.on !== 'function') return null;
 
   const offUnbind = eventCtx.on('dsh-im/session-unbind', (payload) => {
+    if (bindingCache && payload?.sessionId) {
+      bindingCache.delete(payload.sessionId);
+    }
     const cfg = getConfig();
     if (!cfg?.enabled || !cfg?.sessionSwitchGuard?.enabled) return;
     supersededTracker.markUnbound(payload);
@@ -730,6 +822,13 @@ export function installSessionBindingGuard(eventCtx, supersededTracker, getConfi
   }, { global: true });
 
   const offBind = eventCtx.on('dsh-im/session-pre-bind', (payload) => {
+    if (bindingCache && payload?.sessionId && payload?.botId) {
+      cacheSessionBinding(bindingCache, payload.sessionId, {
+        channel: payload.channel ?? null,
+        botId: payload.botId,
+        conversationKey: payload.conversationKey ?? null,
+      });
+    }
     const cfg = getConfig();
     if (!cfg?.enabled || !cfg?.sessionSwitchGuard?.enabled) return;
     supersededTracker.markBound(payload);
@@ -756,6 +855,8 @@ export function createCompanionPlugin({
       const logger = typeof ctx?.logger === 'function' ? ctx.logger(name) : (ctx?.logger ?? console);
       const turnBubbleCounts = new Map();
       const turnSentTexts = new Map();
+      const sessionBindingCache = new Map();
+      let lastBubbleTrace = null;
       const proactiveTracker = createProactiveStateTracker({
         stateFile: stateFilePathFrom(baseConfig),
         nowFn,
@@ -781,12 +882,23 @@ export function createCompanionPlugin({
       }
 
       // 1. Mount HTTP settings endpoint immediately on root `webServer`
-      mountSettingsHttp(ctx, () => baseConfig, setRuntimeConfig, proactiveTracker, keepAwakeManager, supersededTracker, logger);
+      mountSettingsHttp(
+        ctx,
+        () => baseConfig,
+        setRuntimeConfig,
+        proactiveTracker,
+        keepAwakeManager,
+        supersededTracker,
+        logger,
+        () => lastBubbleTrace,
+      );
 
       // 2. Mount global `session/event` & `dsh-im/session-unbind` observers
       if (typeof ctx?.on === 'function') {
         installSessionEventObserver(ctx, proactiveTracker, getConfig);
-        const disposeBindingGuard = installSessionBindingGuard(ctx, supersededTracker, getConfig, logger);
+        const disposeBindingGuard = installSessionBindingGuard(ctx, supersededTracker, getConfig, logger, {
+          bindingCache: sessionBindingCache,
+        });
         if (disposeBindingGuard && typeof ctx?.effect === 'function') {
           ctx.effect(() => disposeBindingGuard, `${name}: session binding guard`);
         }
@@ -910,19 +1022,30 @@ export function createCompanionPlugin({
 
             let sentCount = 0;
             const sentMessages = [];
+            const traceBubbles = [];
+            const turnStartedAt = nowFn();
             for (let i = 0; i < deduped.length; i += 1) {
               const text = deduped[i];
               const delayMs = computeTypingDelayMs(text, cfg.typingDelay, random);
               await sleepFn(delayMs, exec?.signal);
+              const sendStartedAt = nowFn();
               const result = await dshIm.send(routeInfo.botId, routeInfo.targetOrDraft, text, {
                 signal: exec?.signal,
                 format: 'plain',
               });
+              const sentAt = nowFn();
               if (result?.sent !== true) {
                 throw new Error(`dshIm.send did not confirm delivery for bubble #${i + 1}`);
               }
               sentCount += 1;
               sentMessages.push(text);
+              traceBubbles.push({
+                index: i + 1,
+                chars: [...text].length,
+                delayMs,
+                sendMs: Math.max(0, sentAt - sendStartedAt),
+                sentAt,
+              });
               turnBubbleCounts.set(turnKey, alreadySent + sentCount);
             }
 
@@ -930,6 +1053,18 @@ export function createCompanionPlugin({
             if (tailPauseMs > 0) {
               await sleepFn(tailPauseMs, exec?.signal);
             }
+
+            const finishedAt = nowFn();
+            lastBubbleTrace = {
+              recordedAt: finishedAt,
+              channel: routeInfo.channel,
+              bubbles: traceBubbles,
+              tailPauseMs,
+              totalMs: Math.max(0, finishedAt - turnStartedAt),
+            };
+            logger?.info?.(
+              `[${name}] bubbles delivered (${routeInfo.channel}): ${traceBubbles.map((b) => `#${b.index} wait=${b.delayMs}ms api=${b.sendMs}ms`).join(' | ')} | tail=${tailPauseMs}ms`,
+            );
 
             if (turnBubbleCounts.size > 200) {
               const firstKey = turnBubbleCounts.keys().next().value;
@@ -1086,6 +1221,7 @@ export function createCompanionPlugin({
           const disposePreReply = installPreReplyPauseMiddleware(preReplyCtx, dshIm, getConfig, {
             sleepFn,
             random,
+            bindingCache: sessionBindingCache,
           });
           if (disposePreReply && typeof preReplyCtx?.effect === 'function') {
             preReplyCtx.effect(() => disposePreReply, `${name}: pre-reply pause`);
@@ -1102,9 +1238,20 @@ export function createCompanionPlugin({
             applyFileGuard(cfg.fileGuard, ws);
 
             const sessionId = sessionIdOf(assembly?.agent?.session);
-            const described = sessionId && typeof dshIm.describeConversationSync === 'function'
+            let described = sessionId && typeof dshIm.describeConversationSync === 'function'
               ? dshIm.describeConversationSync(sessionId)
               : null;
+            if (!described?.botId && sessionId) {
+              if (sessionBindingCache.has(sessionId)) {
+                described = sessionBindingCache.get(sessionId);
+              } else if (typeof dshIm.describeConversation === 'function') {
+                Promise.resolve(dshIm.describeConversation(sessionId))
+                  .then((resolved) => {
+                    if (resolved?.botId) cacheSessionBinding(sessionBindingCache, sessionId, resolved);
+                  })
+                  .catch(() => {});
+              }
+            }
 
             // If this session was superseded by /new or session switch, instruct it to stop and cancel its remaining schedules
             if (!described?.botId && cfg.sessionSwitchGuard?.enabled && supersededTracker.isSuperseded(sessionId)) {
@@ -1170,8 +1317,13 @@ export function createCompanionPlugin({
             const activeChannel = described?.channel ?? cfg.fallbackTarget.preferredChannel;
             if (cfg.multiBubble.enabled && channelAllowed(activeChannel, cfg.multiBubble.channels)) {
               lines.push(
-                `IM 分气泡发送已开启：如果日常闲聊自然适合分成 2～${cfg.multiBubble.maxBubblesPerTurn + 1} 条短气泡连发，可以先调用 im_send_bubbles 发送前面 1～${cfg.multiBubble.maxBubblesPerTurn} 句，再把最后一句作为本次正常回复输出（严禁重复 im_send_bubbles 已经发过的句子）。一句话就能说完、或回复长篇正事/代码时直接正常回复即可，不用强行拆条。`,
+                `IM 分气泡发送已开启（硬性规范）：日常闲聊只要你想说 2～${cfg.multiBubble.maxBubblesPerTurn + 1} 句短话（如情绪转折、撒娇、顺口补一句），严禁用空行（\\n\\n）把多句话塞进同一个气泡里！必须先调用 im_send_bubbles 发出前面 1～${cfg.multiBubble.maxBubblesPerTurn} 句，再把最后一句作为本次正常回复输出（严禁重复 im_send_bubbles 已经发过的句子）。im_send_bubbles 属于打字发消息动作本身，不是“干活/查资料工具”，日常闲聊请照常使用；只有真的只说一句话、或回复长篇正事/代码/清单时才直接单气泡回复。`,
               );
+              if (detectMultiBubbleDrift(assembly?.agent)) {
+                lines.push(
+                  '【分气泡纠偏提醒】你上一条闲聊回复把多句短话用空行塞进了同一个气泡里！本轮及后续如果有多句短话要说，请务必改用 im_send_bubbles 拆成独立气泡连发，不要再在单气泡里用空行分段。',
+                );
+              }
             }
 
             if (cfg.sticker.enabled) {

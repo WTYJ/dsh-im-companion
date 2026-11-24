@@ -62,6 +62,7 @@ export const DEFAULT_CONFIG = Object.freeze({
   keepAwake: Object.freeze({
     enabled: false,
     preventDisplaySleep: false,
+    sidebarSleepDisplayButton: true,
   }),
   importantDates: Object.freeze({
     enabled: true,
@@ -184,6 +185,10 @@ export function normalizeConfig(raw = {}) {
     keepAwake: {
       enabled: boolOr(ka.enabled, DEFAULT_CONFIG.keepAwake.enabled),
       preventDisplaySleep: boolOr(ka.preventDisplaySleep, DEFAULT_CONFIG.keepAwake.preventDisplaySleep),
+      sidebarSleepDisplayButton: boolOr(
+        ka.sidebarSleepDisplayButton,
+        DEFAULT_CONFIG.keepAwake.sidebarSleepDisplayButton,
+      ),
     },
     importantDates: {
       enabled: boolOr(idates.enabled, DEFAULT_CONFIG.importantDates.enabled),

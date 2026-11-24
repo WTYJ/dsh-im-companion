@@ -8,6 +8,7 @@ import {
   applyFileGuard,
   createCompanionPlugin,
   createProactiveStateTracker,
+  detectMultiBubbleDrift,
   installPreReplyPauseMiddleware,
   installSessionEventObserver,
   resolveDeliveryRoute,
@@ -24,7 +25,7 @@ import {
   normalizeConfig,
 } from '../config.mjs';
 import { draftTargetFromConversation } from '../route.mjs';
-import { buildKeepAwakeCommand, createKeepAwakeManager } from '../keep-awake.mjs';
+import { buildKeepAwakeCommand, buildSleepDisplayCommand, createKeepAwakeManager } from '../keep-awake.mjs';
 import { parseImportantDatesMarkdown, resolveNextLunarOccurrence, scanImportantDates } from '../lunar.mjs';
 
 function makeMockCtx({ described = null } = {}) {
@@ -657,6 +658,325 @@ test('sessionSwitchGuard blocks superseded session fallback, instructs schedule 
     }
     const backPrompt = prompts[0].text({ agent: { session: { id: 'old-sess', events: [] } } });
     assert.doesNotMatch(backPrompt, /旧会话已淘汰防分身/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('detectMultiBubbleDrift detects casual blank-line packing and ignores code/lists', () => {
+  // Casual 2-paragraph single bubble -> drift detected!
+  const casualDrift = detectMultiBubbleDrift({
+    session: {
+      events: [
+        {
+          type: 'assistant/message',
+          data: { message: { content: [{ type: 'text', text: '今天天气不错呀\n\n待会一起去吃饭吧' }] } },
+        },
+      ],
+    },
+  });
+  assert.equal(casualDrift, true);
+
+  // Single short sentence -> no drift
+  const singleLine = detectMultiBubbleDrift({
+    session: {
+      events: [
+        {
+          type: 'assistant/message',
+          data: { message: { content: [{ type: 'text', text: '好呀，那你先忙嘛' }] } },
+        },
+      ],
+    },
+  });
+  assert.equal(singleLine, false);
+
+  // Structured markdown list or code block -> ignored (not casual drift)
+  const codeReply = detectMultiBubbleDrift({
+    session: {
+      events: [
+        {
+          type: 'assistant/message',
+          data: { message: { content: [{ type: 'text', text: '改这里：\n\n```js\nconsole.log(1)\n```' }] } },
+        },
+      ],
+    },
+  });
+  assert.equal(codeReply, false);
+
+  const listReply = detectMultiBubbleDrift({
+    session: {
+      events: [
+        {
+          type: 'assistant/message',
+          data: { message: { content: [{ type: 'text', text: '有两件事：\n\n- 写作业\n- 拿快递' }] } },
+        },
+      ],
+    },
+  });
+  assert.equal(listReply, false);
+});
+
+test('buildSleepDisplayCommand and sleepDisplayNow trigger display sleep without interrupting keep-awake', async () => {
+  const mac = buildSleepDisplayCommand({ platform: 'darwin' });
+  assert.equal(mac.command, '/usr/bin/pmset');
+  assert.deepEqual(mac.args, ['displaysleepnow']);
+
+  const win = buildSleepDisplayCommand({ platform: 'win32' });
+  assert.equal(win.command, 'powershell.exe');
+  assert.ok(win.args.some((a) => a.includes('SendMessage')));
+
+  const linux = buildSleepDisplayCommand({ platform: 'linux' });
+  assert.equal(linux.command, 'xset');
+  assert.deepEqual(linux.args, ['dpms', 'force', 'off']);
+
+  assert.equal(buildSleepDisplayCommand({ platform: 'freebsd' }), null);
+
+  const spawned = [];
+  const fakeSpawn = (cmd, args) => {
+    const proc = { cmd, args, pid: 7000 + spawned.length, killed: false, on() {}, unref() {}, kill() { this.killed = true; } };
+    spawned.push(proc);
+    return proc;
+  };
+
+  let scheduledCb = null;
+  let clearedCount = 0;
+  const mgr = createKeepAwakeManager({
+    platform: 'darwin',
+    pid: 1234,
+    spawnFn: fakeSpawn,
+    setTimeoutFn: (fn, ms) => {
+      scheduledCb = { fn, ms };
+      return { id: 42, unref() {} };
+    },
+    clearTimeoutFn: () => {
+      clearedCount += 1;
+      scheduledCb = null;
+    },
+  });
+
+  // Start keep-awake first
+  mgr.apply({ enabled: true, preventDisplaySleep: false });
+  assert.equal(mgr.getStatus().active, true);
+  assert.equal(mgr.getStatus().sleepDisplaySupported, true);
+  assert.equal(spawned.length, 1);
+
+  // Trigger immediate display sleep: keep-awake stays alive, pmset runs once
+  const r1 = mgr.sleepDisplayNow({ delayMs: 0 });
+  assert.equal(r1.ok, true);
+  assert.equal(r1.scheduled, false);
+  assert.equal(spawned.length, 2);
+  assert.equal(spawned[1].cmd, '/usr/bin/pmset');
+  assert.deepEqual(spawned[1].args, ['displaysleepnow']);
+  assert.equal(spawned[0].killed, false);
+
+  // Trigger delayed display sleep & verify stop() cancels pending timer
+  const r2 = mgr.sleepDisplayNow({ delayMs: 1500 });
+  assert.equal(r2.ok, true);
+  assert.equal(r2.scheduled, true);
+  assert.equal(r2.delayMs, 1500);
+  assert.equal(scheduledCb?.ms, 1500);
+  mgr.stop();
+  assert.equal(clearedCount, 1);
+  assert.equal(scheduledCb, null);
+
+  // Verify config default + HTTP route action
+  const cfgDefault = normalizeConfig({});
+  assert.equal(cfgDefault.keepAwake.sidebarSleepDisplayButton, true);
+  const cfgHidden = normalizeConfig({ keepAwake: { sidebarSleepDisplayButton: false } });
+  assert.equal(cfgHidden.keepAwake.sidebarSleepDisplayButton, false);
+
+  let registeredHandler = null;
+  let sleepCalledWith = null;
+  const mockCtx = {
+    logger: () => ({ info() {}, warn() {}, error() {} }),
+    webServer: {
+      register(entry) {
+        registeredHandler = entry.handler;
+        return () => {};
+      },
+    },
+  };
+  const plugin = createCompanionPlugin({
+    keepAwakeFactory: () => ({
+      apply: () => ({ supported: true, sleepDisplaySupported: true, active: true, platform: 'darwin' }),
+      stop: () => {},
+      getStatus: () => ({ supported: true, sleepDisplaySupported: true, active: true, platform: 'darwin' }),
+      sleepDisplayNow: (opts) => {
+        sleepCalledWith = opts;
+        return { ok: true, scheduled: false, delayMs: opts.delayMs, method: 'macOS pmset displaysleepnow', error: null };
+      },
+    }),
+  });
+  plugin.apply(mockCtx, { configFile: false });
+  assert.ok(registeredHandler);
+
+  const req = {
+    method: 'POST',
+    on(event, cb) {
+      if (event === 'data') cb(Buffer.from(JSON.stringify({ action: 'sleepDisplayNow', delayMs: 0 })));
+      if (event === 'end') cb();
+    },
+  };
+  let statusCode = 0;
+  let bodyText = '';
+  const res = {
+    set statusCode(v) { statusCode = v; },
+    get statusCode() { return statusCode; },
+    setHeader() {},
+    end(txt) { bodyText = txt; },
+  };
+  await registeredHandler(req, res);
+  assert.equal(statusCode, 200);
+  assert.deepEqual(sleepCalledWith, { delayMs: 0 });
+  const parsed = JSON.parse(bodyText);
+  assert.equal(parsed.ok, true);
+  assert.equal(parsed.method, 'macOS pmset displaysleepnow');
+});
+
+test('QQ async describeConversation fallback enables preReplyPause, handoff notice, and records lastBubbleTrace', async () => {
+  // 1. Pre-reply pause works when describeConversationSync returns null (QQ adapter behavior)
+  let preStepHandler = null;
+  const slept = [];
+  const bindingCache = new Map();
+  const mockEventCtx = {
+    on(eventName, fn) {
+      if (eventName === 'agent/pre-step') preStepHandler = fn;
+      return () => {};
+    },
+  };
+  let asyncDescribeCalls = 0;
+  const mockQqDshIm = {
+    describeConversationSync() { return null; }, // QQ adapter leaves stateForSync = null!
+    async describeConversation(sessionId) {
+      asyncDescribeCalls += 1;
+      if (sessionId === 'qq-sess-1') {
+        return { channel: 'qq', botId: 'bot_qq', conversationKey: 'c2c:U1', targetType: 'c2c', targetId: 'U1' };
+      }
+      return null;
+    },
+  };
+  const cfg = normalizeConfig({
+    typingDelay: { enabled: true, preReplyPauseEnabled: true, preReplyMinMs: 1400, preReplyMaxMs: 2200 },
+  });
+  installPreReplyPauseMiddleware(mockEventCtx, mockQqDshIm, () => cfg, {
+    sleepFn: async (ms) => { slept.push(ms); },
+    random: () => 0.5,
+    bindingCache,
+  });
+
+  // QQ user turn -> pauses 1800ms and caches binding
+  await preStepHandler(
+    { agent: { session: { id: 'qq-sess-1', events: [] } } },
+    async () => ({ kind: 'enter', messages: [{ id: 'm1', source: { kind: 'user' } }] }),
+  );
+  assert.deepEqual(slept, [1800]);
+  assert.equal(asyncDescribeCalls, 1);
+  assert.equal(bindingCache.get('qq-sess-1')?.botId, 'bot_qq');
+
+  // Second QQ user turn uses cache without redundant async lookup
+  await preStepHandler(
+    { agent: { session: { id: 'qq-sess-1', events: [] } } },
+    async () => ({ kind: 'enter', messages: [{ id: 'm2', source: { kind: 'user' } }] }),
+  );
+  assert.deepEqual(slept, [1800, 1800]);
+  assert.equal(asyncDescribeCalls, 1);
+
+  // Desktop session (describeConversation returns null) -> skipped, 0 pause
+  await preStepHandler(
+    { agent: { session: { id: 'desktop-sess', events: [] } } },
+    async () => ({ kind: 'enter', messages: [{ id: 'm3', source: { kind: 'user' } }] }),
+  );
+  assert.deepEqual(slept, [1800, 1800]);
+
+  // 2. End-to-end plugin: handoff notice via pre-bind cache & lastBubbleTrace via HTTP GET
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-im-qq-trace-'));
+  try {
+    const schedFile = join(dir, 'schedule.json');
+    writeFileSync(schedFile, JSON.stringify({
+      tables: {
+        tasks: {
+          s1: {
+            status: 'active',
+            target: { kind: 'session', sessionId: 'old-qq' },
+            record: { id: 's1', title: '起床闹钟', scheduledAt: '2026-11-25T00:00:00.000Z' },
+          },
+        },
+      },
+    }), 'utf8');
+
+    const listeners = new Map();
+    const tools = new Map();
+    const prompts = [];
+    let httpHandler = null;
+    let clock = 1_795_510_000_000;
+
+    const fullCtx = {
+      logger: () => ({ info() {}, warn() {}, error() {} }),
+      on(ev, fn) {
+        if (!listeners.has(ev)) listeners.set(ev, []);
+        listeners.get(ev).push(fn);
+        return () => {};
+      },
+      webServer: {
+        register(entry) { httpHandler = entry.handler; return () => {}; },
+      },
+      dshIm: {
+        describeConversationSync() { return null; }, // Simulate QQ
+        async describeConversation(sid) {
+          if (sid === 'new-qq') {
+            return { channel: 'qq', botId: 'bot_qq', conversationKey: 'c2c:U1', targetType: 'c2c', targetId: 'U1' };
+          }
+          return null;
+        },
+        async send() { clock += 120; return { sent: true }; },
+      },
+      tools: { register(t) { tools.set(t.name, t); } },
+      systemPrompt: { context(p) { prompts.push(p); } },
+    };
+
+    const plugin = createCompanionPlugin({
+      nowFn: () => clock,
+      random: () => 0.5,
+      sleepFn: async (ms) => { clock += ms; },
+      scheduleFilePath: schedFile,
+      keepAwakeFactory: () => ({
+        apply: () => ({ supported: true, sleepDisplaySupported: true, active: false }),
+        stop: () => {},
+        getStatus: () => ({ supported: true, sleepDisplaySupported: true, active: false }),
+      }),
+    });
+    plugin.apply(fullCtx, { configFile: join(dir, 'settings.json'), fileGuard: { enabled: false } });
+
+    // Unbind old-qq and bind new-qq
+    for (const fn of listeners.get('dsh-im/session-unbind') || []) {
+      fn({ channel: 'qq', botId: 'bot_qq', conversationKey: 'c2c:U1', sessionId: 'old-qq' });
+    }
+    for (const fn of listeners.get('dsh-im/session-pre-bind') || []) {
+      fn({ channel: 'qq', botId: 'bot_qq', conversationKey: 'c2c:U1', sessionId: 'new-qq' });
+    }
+
+    // Even with describeConversationSync() === null, new-qq receives handoff notice!
+    const newPrompt = prompts[0].text({ agent: { session: { id: 'new-qq', events: [] } } });
+    assert.match(newPrompt, /起床闹钟/);
+
+    // Send 2 bubbles and inspect GET /dsh-im-companion/settings lastBubbleTrace
+    await tools.get('im_send_bubbles').execute(
+      { messages: ['第一句测试', '第二句测试啦'] },
+      { agent: { session: { id: 'new-qq', events: [] } } },
+    );
+
+    let body = '';
+    await httpHandler(
+      { method: 'GET' },
+      { statusCode: 0, setHeader() {}, end(t) { body = t; } },
+    );
+    const data = JSON.parse(body);
+    assert.equal(data.ok, true);
+    assert.equal(data.lastBubbleTrace?.channel, 'qq');
+    assert.equal(data.lastBubbleTrace?.bubbles?.length, 2);
+    assert.equal(data.lastBubbleTrace.bubbles[0].sendMs, 120);
+    assert.ok(data.lastBubbleTrace.bubbles[0].delayMs >= 1200);
+    assert.ok(data.lastBubbleTrace.tailPauseMs >= 1200);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
